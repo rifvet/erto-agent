@@ -131,25 +131,27 @@ import pandas as pd
 from sqlalchemy import text
 from datetime import date
 
+from fastapi import Query
+
 @app.post("/ingest_csv")
 async def ingest_csv(
     file: UploadFile = File(...),
-    dry_run: bool = Query(False, description="If true, parse & normalize only; do not write to DB")
+    dry_run: bool = Query(False, description="Parse only; don't write to DB")
 ):
     if not file.filename.lower().endswith(".csv"):
         raise HTTPException(status_code=400, detail="Please upload a .csv file")
 
-    # 1) Read CSV safely
+    # 1) Read CSV
     try:
         raw = await file.read()
         df = pd.read_csv(io.BytesIO(raw))
     except Exception as e:
         raise HTTPException(status_code=400, detail=f"CSV parse error: {e}")
 
-    # 2) Normalize headers (same mapping you had)
+    # 2) Normalize headers you commonly get from Meta
     df.rename(columns=META_RENAME, inplace=True)
 
-    # Ensure identifiers
+    # Ensure identifiers exist
     if "ad_id" not in df.columns and "ad_name" in df.columns:
         df["ad_id"] = df["ad_name"].astype(str)
     if "ad_name" not in df.columns and "ad_id" in df.columns:
@@ -162,13 +164,13 @@ async def ingest_csv(
         if col not in df.columns:
             df[col] = ""
 
-    # Create missing metric columns as 0 and coerce numerics
+    # Fill/convert numeric metrics
     for col in NUMERIC_COLS:
         if col not in df.columns:
             df[col] = 0
         df[col] = pd.to_numeric(df[col], errors="coerce").fillna(0)
 
-    # Add date if missing
+    # Add date
     if "dte" not in df.columns:
         df["dte"] = str(date.today())
 
@@ -179,7 +181,7 @@ async def ingest_csv(
     ]
     df = df[[c for c in keep_cols if c in df.columns]]
 
-    # 3) Dry-run mode: show what we parsed (no DB write)
+    # 3) Dry-run shows us what we parsed (no DB write)
     if dry_run:
         return {
             "status": "dry_run_ok",
