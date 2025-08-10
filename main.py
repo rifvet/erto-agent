@@ -74,7 +74,22 @@ def update_brand(b: BrandUpdate):
 
 @app.post("/ingest_csv")
 async def ingest_csv(file: UploadFile = File(...)):
-    df = pd.read_csv(file.file).fillna(0)
+    df = pd.read_csv(file.file).fillna(0) 
+    # Normalize common Meta headers → internal names we use everywhere
+# Supports both Ad ID and Ad Name. Falls back cleanly if one is missing.
+df.rename(columns={
+    "Ad ID": "ad_id",
+    "Ad Name": "ad_name",
+}, inplace=True)
+
+if "ad_id" not in df.columns and "ad_name" in df.columns:
+    df["ad_id"] = df["ad_name"].astype(str)
+if "ad_name" not in df.columns and "ad_id" in df.columns:
+    df["ad_name"] = df["ad_id"].astype(str)
+
+# Make sure both exist (even if CSV lacked both columns)
+df["ad_id"] = df.get("ad_id", "NA").fillna("NA").astype(str)
+df["ad_name"] = df.get("ad_name", df["ad_id"]).fillna("NA").astype(str)
     if "dte" not in df.columns:
         df["dte"] = str(date.today())
     with engine.begin() as conn:
