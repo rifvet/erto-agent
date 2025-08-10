@@ -125,19 +125,28 @@ async def health():
     return {"status": "ok"}
 
 
+from fastapi import FastAPI, UploadFile, File, HTTPException, Query
+import io
+import pandas as pd
+from sqlalchemy import text
+from datetime import date
+
 @app.post("/ingest_csv")
-async def ingest_csv(file: UploadFile = File(...)):
-    """Upload a Meta CSV for *today*. Rows append into ad_metrics."""
-    if not file.filename.lower().endswith((".csv")):
+async def ingest_csv(
+    file: UploadFile = File(...),
+    dry_run: bool = Query(False, description="If true, parse & normalize only; do not write to DB")
+):
+    if not file.filename.lower().endswith(".csv"):
         raise HTTPException(status_code=400, detail="Please upload a .csv file")
 
-    raw = await file.read()
+    # 1) Read CSV safely
     try:
+        raw = await file.read()
         df = pd.read_csv(io.BytesIO(raw))
     except Exception as e:
         raise HTTPException(status_code=400, detail=f"CSV parse error: {e}")
 
-    # Normalize headers
+    # 2) Normalize headers (same mapping you had)
     df.rename(columns=META_RENAME, inplace=True)
 
     # Ensure identifiers
@@ -153,20 +162,16 @@ async def ingest_csv(file: UploadFile = File(...)):
         if col not in df.columns:
             df[col] = ""
 
-    # Create missing metric columns as 0
+    # Create missing metric columns as 0 and coerce numerics
     for col in NUMERIC_COLS:
         if col not in df.columns:
             df[col] = 0
-
-    # Coerce numerics
-    for col in NUMERIC_COLS:
         df[col] = pd.to_numeric(df[col], errors="coerce").fillna(0)
 
-    # Add date column
+    # Add date if missing
     if "dte" not in df.columns:
         df["dte"] = str(date.today())
 
-    # Keep only known columns when writing
     keep_cols = [
         "dte", "ad_id", "ad_name", "campaign_name", "adset_name",
         "spend", "impressions", "ctr", "cpc", "hook_rate", "hold_rate",
@@ -174,10 +179,24 @@ async def ingest_csv(file: UploadFile = File(...)):
     ]
     df = df[[c for c in keep_cols if c in df.columns]]
 
-    with engine.begin() as conn:
-        df.to_sql("ad_metrics", conn, if_exists="append", index=False)
+    # 3) Dry-run mode: show what we parsed (no DB write)
+    if dry_run:
+        return {
+            "status": "dry_run_ok",
+            "rows": int(len(df)),
+            "columns": list(df.columns),
+            "preview": df.head(5).to_dict(orient="records"),
+        }
+
+    # 4) Write to DB with explicit error surfacing
+    try:
+        with engine.begin() as conn:
+            df.to_sql("ad_metrics", conn, if_exists="append", index=False)
+    except Exception as e:
+        raise HTTPException(status_code=400, detail=f"DB write failed: {e}")
 
     return {"status": "ok", "rows": int(len(df))}
+
 
 
 @app.post("/analyze")
