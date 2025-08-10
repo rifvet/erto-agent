@@ -1,4 +1,4 @@
-from fastapi import FastAPI, UploadFile, File, HTTPException
+from fastapi import FastAPI, UploadFile, File, HTTPException, Query
 from pydantic import BaseModel, Field
 from sqlalchemy import create_engine, text
 from datetime import date
@@ -7,9 +7,9 @@ import json
 import os
 import io
 
-# --- Settings & KPIs ---
+# --- Settings & KPIs (from settings.py or env with safe fallbacks) ---
 try:
-    import settings as cfg  # your settings.py
+    import settings as cfg
 except Exception:
     cfg = object()
 
@@ -26,7 +26,7 @@ TARGET_CVR = float(_get("TARGET_CVR", "4.2"))
 MIN_SPEND_TO_DECIDE = float(_get("MIN_SPEND_TO_DECIDE", "50"))
 
 # --- App & DB ---
-app = FastAPI(title="Erto Ad Strategist Agent", version="1.0.0")
+app = FastAPI(title="Erto Ad Strategist Agent", version="1.1.0")
 engine = create_engine(DATABASE_URL, future=True)
 
 # Create table if it doesn’t exist
@@ -62,6 +62,9 @@ class AnalyzeRequest(BaseModel):
 class DiagnoseRequest(BaseModel):
     site_speed_sec: float | None = None
 
+class UpdateBrandRequest(BaseModel):
+    brand: dict
+
 # --- Helpers ---
 NUMERIC_COLS = [
     "spend", "impressions", "ctr", "cpc", "hook_rate", "hold_rate", "cvr", "roas", "cpa",
@@ -92,7 +95,6 @@ META_RENAME = {
 
 BRAND_FILE = "brand_knowledge.json"
 
-
 def load_brand() -> dict:
     try:
         with open(BRAND_FILE, "r", encoding="utf-8") as f:
@@ -107,7 +109,6 @@ def load_brand() -> dict:
             "competitors": ["Generic Brand A", "Brand B"],
             "usps": ["Real materials", "Faster shipping", "Support that cares"],
         }
-
 
 def to_float(val):
     try:
@@ -124,34 +125,26 @@ def to_float(val):
 async def health():
     return {"status": "ok"}
 
-
-from fastapi import FastAPI, UploadFile, File, HTTPException, Query
-import io
-import pandas as pd
-from sqlalchemy import text
-from datetime import date
-
-from fastapi import Query
-
 @app.post("/ingest_csv")
 async def ingest_csv(
     file: UploadFile = File(...),
     dry_run: bool = Query(False, description="Parse only; don't write to DB")
 ):
+    """Upload a Meta CSV for *today*. Use ?dry_run=true to preview parse results without writing."""
     if not file.filename.lower().endswith(".csv"):
         raise HTTPException(status_code=400, detail="Please upload a .csv file")
 
-    # 1) Read CSV
+    # Read + parse CSV
     try:
         raw = await file.read()
         df = pd.read_csv(io.BytesIO(raw))
     except Exception as e:
         raise HTTPException(status_code=400, detail=f"CSV parse error: {e}")
 
-    # 2) Normalize headers you commonly get from Meta
+    # Normalize headers → internal names
     df.rename(columns=META_RENAME, inplace=True)
 
-    # Ensure identifiers exist
+    # Ensure ID/Name exist (support either one)
     if "ad_id" not in df.columns and "ad_name" in df.columns:
         df["ad_id"] = df["ad_name"].astype(str)
     if "ad_name" not in df.columns and "ad_id" in df.columns:
@@ -164,16 +157,17 @@ async def ingest_csv(
         if col not in df.columns:
             df[col] = ""
 
-    # Fill/convert numeric metrics
+    # Create missing metric columns as 0 and coerce numerics
     for col in NUMERIC_COLS:
         if col not in df.columns:
             df[col] = 0
         df[col] = pd.to_numeric(df[col], errors="coerce").fillna(0)
 
-    # Add date
+    # Add date column
     if "dte" not in df.columns:
         df["dte"] = str(date.today())
 
+    # Keep only known columns when writing
     keep_cols = [
         "dte", "ad_id", "ad_name", "campaign_name", "adset_name",
         "spend", "impressions", "ctr", "cpc", "hook_rate", "hold_rate",
@@ -181,7 +175,7 @@ async def ingest_csv(
     ]
     df = df[[c for c in keep_cols if c in df.columns]]
 
-    # 3) Dry-run shows us what we parsed (no DB write)
+    # Dry run → show preview instead of writing
     if dry_run:
         return {
             "status": "dry_run_ok",
@@ -190,7 +184,7 @@ async def ingest_csv(
             "preview": df.head(5).to_dict(orient="records"),
         }
 
-    # 4) Write to DB with explicit error surfacing
+    # Write to DB with friendly error if it fails
     try:
         with engine.begin() as conn:
             df.to_sql("ad_metrics", conn, if_exists="append", index=False)
@@ -198,8 +192,6 @@ async def ingest_csv(
         raise HTTPException(status_code=400, detail=f"DB write failed: {e}")
 
     return {"status": "ok", "rows": int(len(df))}
-
-
 
 @app.post("/analyze")
 async def analyze(req: AnalyzeRequest):
@@ -287,7 +279,6 @@ async def analyze(req: AnalyzeRequest):
         },
     }
 
-
 @app.post("/diagnose")
 async def diagnose(req: DiagnoseRequest):
     today = str(date.today())
@@ -297,7 +288,6 @@ async def diagnose(req: DiagnoseRequest):
     if df.empty:
         return {"message": "No data ingested today. Upload a CSV via /ingest_csv first."}
 
-    # Totals (use available columns)
     totals = {
         "spend": float(df.get("spend", pd.Series([0])).sum()),
         "impressions": int(df.get("impressions", pd.Series([0])).sum()),
@@ -307,7 +297,6 @@ async def diagnose(req: DiagnoseRequest):
         "avg_cpa": float(df.get("cpa", pd.Series([0])).mean()),
     }
 
-    # Simple weak-point logic
     issues = []
     if totals["avg_ctr"] < 1.0:
         issues.append("Low CTR (<1%): hooks/thumbnails not stopping scroll")
@@ -319,8 +308,6 @@ async def diagnose(req: DiagnoseRequest):
         issues.append(f"CPA above breakeven (>{BREAKEVEN_CPA_TRUE_AOV})")
 
     brand = load_brand()
-
-    # Claude-ready prompts (you paste into Claude)
     prompts = {
         "hooks": f"Write 10 scroll-stopping hooks (max 7 words) in the brand voice: {brand.get('brand_voice','')}. Target pains: {brand.get('avatars',[{}])[0].get('pains', [])}.",
         "scripts": f"Draft 3x 30s UGC scripts using {brand.get('usps', [])} with curiosity opener → proof → CTA. Include at least one objection-handle.",
@@ -338,15 +325,9 @@ async def diagnose(req: DiagnoseRequest):
         "claude_prompts": prompts,
     }
 
-
 @app.get("/brand")
 async def get_brand():
     return load_brand()
-
-
-class UpdateBrandRequest(BaseModel):
-    brand: dict
-
 
 @app.post("/update_brand_knowledge")
 async def update_brand_knowledge(req: UpdateBrandRequest):
@@ -356,5 +337,3 @@ async def update_brand_knowledge(req: UpdateBrandRequest):
         return {"status": "ok"}
     except Exception as e:
         raise HTTPException(status_code=500, detail=str(e))
-
-# (No need for if __name__ == "__main__": as Render runs uvicorn directly)
