@@ -1,4 +1,4 @@
-from fastapi import FastAPI, UploadFile, File, HTTPException, Query
+from fastapi import FastAPI, UploadFile, File, HTTPException, Query, Request
 from pydantic import BaseModel, Field
 from sqlalchemy import create_engine, text
 from datetime import date
@@ -7,9 +7,11 @@ import json
 import os
 import io
 
-# --- Settings & KPIs (from settings.py or env with safe fallbacks) ---
+# -----------------------------
+# Settings & KPI fallbacks
+# -----------------------------
 try:
-    import settings as cfg
+    import settings as cfg  # optional; env vars used if missing
 except Exception:
     cfg = object()
 
@@ -25,11 +27,13 @@ BREAKEVEN_CPA_BUY1 = float(_get("BREAKEVEN_CPA_BUY1", "65.50"))
 TARGET_CVR = float(_get("TARGET_CVR", "4.2"))
 MIN_SPEND_TO_DECIDE = float(_get("MIN_SPEND_TO_DECIDE", "50"))
 
-# --- App & DB ---
-app = FastAPI(title="Erto Ad Strategist Agent", version="1.1.0")
+# -----------------------------
+# App & DB init
+# -----------------------------
+app = FastAPI(title="Erto Ad Strategist Agent", version="1.2.0")
 engine = create_engine(DATABASE_URL, future=True)
 
-# Create table if it doesn’t exist
+# Create table if not exists
 with engine.begin() as conn:
     conn.execute(text(
         """
@@ -53,7 +57,9 @@ with engine.begin() as conn:
         """
     ))
 
-# --- Models ---
+# -----------------------------
+# Models
+# -----------------------------
 class AnalyzeRequest(BaseModel):
     testing_capacity: int = 6
     angle_mix: dict = Field(default_factory=lambda: {"pain": 40, "curiosity": 30, "proof": 20, "social": 10})
@@ -65,7 +71,9 @@ class DiagnoseRequest(BaseModel):
 class UpdateBrandRequest(BaseModel):
     brand: dict
 
-# --- Helpers ---
+# -----------------------------
+# Helpers & constants
+# -----------------------------
 NUMERIC_COLS = [
     "spend", "impressions", "ctr", "cpc", "hook_rate", "hold_rate", "cvr", "roas", "cpa",
 ]
@@ -80,9 +88,6 @@ META_RENAME = {
     "Impressions": "impressions",
     "CTR (All)": "ctr",
     "CPC (Cost per link click)": "cpc",
-    "Adds to Cart": "add_to_cart",
-    "Initiate Checkout": "initiate_checkout",
-    "Purchases": "purchases",
     # Sometimes exports already come simplified; mapping won’t hurt
     "spend": "spend",
     "impressions": "impressions",
@@ -120,79 +125,120 @@ def to_float(val):
     except Exception:
         return 0.0
 
-# --- Routes ---
+# -----------------------------
+# Health
+# -----------------------------
 @app.get("/health")
 async def health():
     return {"status": "ok"}
 
+# -----------------------------
+# Debug CSV ingest (to isolate parser issues)
+# -----------------------------
+@app.post("/ingest_csv_debug")
+async def ingest_csv_debug(file: UploadFile = File(...), request: Request | None = None):
+    """
+    Minimal ingest to isolate issues:
+    - reads CSV
+    - returns columns + first 5 rows
+    - no renaming, no DB writes
+    """
+    try:
+        raw = await file.read()
+        if not raw:
+            raise HTTPException(status_code=400, detail="Uploaded file was empty.")
+        try:
+            df = pd.read_csv(io.BytesIO(raw))
+        except Exception:
+            df = pd.read_csv(io.BytesIO(raw), engine="python")
+        return {
+            "filename": file.filename,
+            "shape": [int(df.shape[0]), int(df.shape[1])],
+            "columns": list(map(str, df.columns)),
+            "head": df.head(5).to_dict(orient="records"),
+        }
+    except HTTPException:
+        raise
+    except Exception as e:
+        raise HTTPException(status_code=400, detail=f"Debug parse failed: {type(e).__name__}: {e}")
+
+# -----------------------------
+# Hardened ingest (with dry_run)
+# -----------------------------
 @app.post("/ingest_csv")
 async def ingest_csv(
     file: UploadFile = File(...),
     dry_run: bool = Query(False, description="Parse only; don't write to DB")
 ):
-    """Upload a Meta CSV for *today*. Use ?dry_run=true to preview parse results without writing."""
-    if not file.filename.lower().endswith(".csv"):
-        raise HTTPException(status_code=400, detail="Please upload a .csv file")
-
-    # Read + parse CSV
     try:
+        if not file.filename.lower().endswith(".csv"):
+            raise HTTPException(status_code=400, detail="Please upload a .csv file")
+
         raw = await file.read()
-        df = pd.read_csv(io.BytesIO(raw))
-    except Exception as e:
-        raise HTTPException(status_code=400, detail=f"CSV parse error: {e}")
+        if not raw:
+            raise HTTPException(status_code=400, detail="Uploaded file was empty.")
 
-    # Normalize headers → internal names
-    df.rename(columns=META_RENAME, inplace=True)
+        # Parse CSV (try fast first, then python engine)
+        try:
+            df = pd.read_csv(io.BytesIO(raw))
+        except Exception:
+            df = pd.read_csv(io.BytesIO(raw), engine="python")
 
-    # Ensure ID/Name exist (support either one)
-    if "ad_id" not in df.columns and "ad_name" in df.columns:
-        df["ad_id"] = df["ad_name"].astype(str)
-    if "ad_name" not in df.columns and "ad_id" in df.columns:
-        df["ad_name"] = df["ad_id"].astype(str)
-    df["ad_id"] = df.get("ad_id", "NA").fillna("NA").astype(str)
-    df["ad_name"] = df.get("ad_name", df["ad_id"]).fillna("NA").astype(str)
+        # Normalize headers
+        df.rename(columns=META_RENAME, inplace=True)
 
-    # Optional common fields
-    for col in ["campaign_name", "adset_name"]:
-        if col not in df.columns:
-            df[col] = ""
+        # Ensure identifiers
+        if "ad_id" not in df.columns and "ad_name" in df.columns:
+            df["ad_id"] = df["ad_name"].astype(str)
+        if "ad_name" not in df.columns and "ad_id" in df.columns:
+            df["ad_name"] = df["ad_id"].astype(str)
+        df["ad_id"] = df.get("ad_id", "NA").fillna("NA").astype(str)
+        df["ad_name"] = df.get("ad_name", df["ad_id"]).fillna("NA").astype(str)
 
-    # Create missing metric columns as 0 and coerce numerics
-    for col in NUMERIC_COLS:
-        if col not in df.columns:
-            df[col] = 0
-        df[col] = pd.to_numeric(df[col], errors="coerce").fillna(0)
+        # Optional common fields
+        for col in ["campaign_name", "adset_name"]:
+            if col not in df.columns:
+                df[col] = ""
 
-    # Add date column
-    if "dte" not in df.columns:
-        df["dte"] = str(date.today())
+        # Metrics (create if missing, coerce numerics)
+        for col in NUMERIC_COLS:
+            if col not in df.columns:
+                df[col] = 0
+            df[col] = pd.to_numeric(df[col], errors="coerce").fillna(0)
 
-    # Keep only known columns when writing
-    keep_cols = [
-        "dte", "ad_id", "ad_name", "campaign_name", "adset_name",
-        "spend", "impressions", "ctr", "cpc", "hook_rate", "hold_rate",
-        "cvr", "roas", "cpa",
-    ]
-    df = df[[c for c in keep_cols if c in df.columns]]
+        # Date
+        if "dte" not in df.columns:
+            df["dte"] = str(date.today())
 
-    # Dry run → show preview instead of writing
-    if dry_run:
-        return {
-            "status": "dry_run_ok",
-            "rows": int(len(df)),
-            "columns": list(df.columns),
-            "preview": df.head(5).to_dict(orient="records"),
-        }
+        keep_cols = [
+            "dte", "ad_id", "ad_name", "campaign_name", "adset_name",
+            "spend", "impressions", "ctr", "cpc", "hook_rate", "hold_rate",
+            "cvr", "roas", "cpa",
+        ]
+        df = df[[c for c in keep_cols if c in df.columns]]
 
-    # Write to DB with friendly error if it fails
-    try:
+        # Dry run: just preview
+        if dry_run:
+            return {
+                "status": "dry_run_ok",
+                "rows": int(len(df)),
+                "columns": list(df.columns),
+                "preview": df.head(5).to_dict(orient="records"),
+            }
+
+        # Write to DB
         with engine.begin() as conn:
             df.to_sql("ad_metrics", conn, if_exists="append", index=False)
+
+        return {"status": "ok", "rows": int(len(df))}
+    except HTTPException:
+        raise
     except Exception as e:
-        raise HTTPException(status_code=400, detail=f"DB write failed: {e}")
+        raise HTTPException(status_code=400, detail=f"Ingest failed: {type(e).__name__}: {e}")
 
-    return {"status": "ok", "rows": int(len(df))}
-
+# -----------------------------
+# Analyze (per-ad)
+# -----------------------------
 @app.post("/analyze")
 async def analyze(req: AnalyzeRequest):
     today = str(date.today())
@@ -211,13 +257,11 @@ async def analyze(req: AnalyzeRequest):
             },
         }
 
-    # Ensure identifiers
     if "ad_id" not in df.columns:
         df["ad_id"] = "NA"
     if "ad_name" not in df.columns:
         df["ad_name"] = df["ad_id"]
 
-    # Aggregate per ad
     agg = (
         df.groupby("ad_id", as_index=False)
           .agg(
@@ -279,6 +323,9 @@ async def analyze(req: AnalyzeRequest):
         },
     }
 
+# -----------------------------
+# Diagnose (totals + prompts)
+# -----------------------------
 @app.post("/diagnose")
 async def diagnose(req: DiagnoseRequest):
     today = str(date.today())
@@ -325,6 +372,9 @@ async def diagnose(req: DiagnoseRequest):
         "claude_prompts": prompts,
     }
 
+# -----------------------------
+# Brand knowledge endpoints
+# -----------------------------
 @app.get("/brand")
 async def get_brand():
     return load_brand()
@@ -337,3 +387,5 @@ async def update_brand_knowledge(req: UpdateBrandRequest):
         return {"status": "ok"}
     except Exception as e:
         raise HTTPException(status_code=500, detail=str(e))
+
+# Render runs uvicorn via start command; no __main__ needed.
