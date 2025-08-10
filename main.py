@@ -1,17 +1,15 @@
 from fastapi import FastAPI, UploadFile, File, HTTPException
 from pydantic import BaseModel, Field
 from sqlalchemy import create_engine, text
-from datetime import date, datetime, timedelta
+from datetime import date
 import pandas as pd
 import json
 import os
 import io
 
-# ======================
-# Settings & KPI loading
-# ======================
+# --- Settings & KPIs ---
 try:
-    import settings as cfg  # optional local settings.py
+    import settings as cfg  # your settings.py
 except Exception:
     cfg = object()
 
@@ -19,28 +17,25 @@ def _get(name: str, default: str):
     return getattr(cfg, name, os.getenv(name, default))
 
 DATABASE_URL = _get("DATABASE_URL", "sqlite:///erto_agent.db")
-
 TARGET_ROAS = float(_get("TARGET_ROAS", "2.54"))
 BREAKEVEN_ROAS = float(_get("BREAKEVEN_ROAS", "1.54"))
 TARGET_CPA = float(_get("TARGET_CPA", "39.30"))
 BREAKEVEN_CPA_TRUE_AOV = float(_get("BREAKEVEN_CPA_TRUE_AOV", "81.56"))
-BREAKEVEN_CPA_BUY1 = float(_get("BREAKEVEN_CPA_BUY1", "65.50"))  # not used in rules below but kept for future
+BREAKEVEN_CPA_BUY1 = float(_get("BREAKEVEN_CPA_BUY1", "65.50"))
 TARGET_CVR = float(_get("TARGET_CVR", "4.2"))
 MIN_SPEND_TO_DECIDE = float(_get("MIN_SPEND_TO_DECIDE", "50"))
 
-BRAND_FILE = "brand_knowledge.json"
-
-# ======================
-# App & DB bootstrap
-# ======================
-app = FastAPI(title="Erto Ad Strategist Agent", version="1.2.0")
+# --- App & DB ---
+app = FastAPI(title="Erto Ad Strategist Agent", version="1.0.0")
 engine = create_engine(DATABASE_URL, future=True)
 
+# Create table if it doesn’t exist
 with engine.begin() as conn:
-    conn.execute(text("""
+    conn.execute(text(
+        """
         CREATE TABLE IF NOT EXISTS ad_metrics (
             id INTEGER PRIMARY KEY AUTOINCREMENT,
-            dte TEXT,                 -- ISO date string: YYYY-MM-DD
+            dte TEXT,
             ad_id TEXT,
             ad_name TEXT,
             campaign_name TEXT,
@@ -55,40 +50,25 @@ with engine.begin() as conn:
             roas REAL,
             cpa REAL
         );
-    """))
+        """
+    ))
 
-# ======================
-# Models
-# ======================
+# --- Models ---
 class AnalyzeRequest(BaseModel):
-    # decision & creative plan
     testing_capacity: int = 6
     angle_mix: dict = Field(default_factory=lambda: {"pain": 40, "curiosity": 30, "proof": 20, "social": 10})
     bans: list[str] = Field(default_factory=list)
 
-    # timeframe controls (pick ONE style or leave all empty to use ALL data)
-    use_all: bool = False
-    days_back: int | None = None  # e.g., 14 for last 14 days (inclusive)
-    start_date: str | None = None # "YYYY-MM-DD"
-    end_date: str | None = None   # "YYYY-MM-DD"
-
 class DiagnoseRequest(BaseModel):
     site_speed_sec: float | None = None
-    # same timeframe controls as analyze
-    use_all: bool = False
-    days_back: int | None = None
-    start_date: str | None = None
-    end_date: str | None = None
 
-# ======================
-# Helpers
-# ======================
+# --- Helpers ---
 NUMERIC_COLS = [
     "spend", "impressions", "ctr", "cpc", "hook_rate", "hold_rate", "cvr", "roas", "cpa",
 ]
 
 META_RENAME = {
-    # Common Meta headers -> internal names
+    # Common Meta export headers → internal
     "Ad ID": "ad_id",
     "Ad Name": "ad_name",
     "Campaign Name": "campaign_name",
@@ -97,7 +77,10 @@ META_RENAME = {
     "Impressions": "impressions",
     "CTR (All)": "ctr",
     "CPC (Cost per link click)": "cpc",
-    # If your CSV already has simple names, leave them; mapping is idempotent
+    "Adds to Cart": "add_to_cart",
+    "Initiate Checkout": "initiate_checkout",
+    "Purchases": "purchases",
+    # Sometimes exports already come simplified; mapping won’t hurt
     "spend": "spend",
     "impressions": "impressions",
     "ctr": "ctr",
@@ -107,28 +90,8 @@ META_RENAME = {
     "cpa": "cpa",
 }
 
-DATE_CANDIDATES = [
-    "dte",
-    "Date",
-    "date",
-    "Day",
-    "day",
-    "Reporting Starts",
-    "Reporting Start",
-    "Reporting start",
-    "Start Date",
-    "start_date",
-]
+BRAND_FILE = "brand_knowledge.json"
 
-def to_float(val):
-    try:
-        if val is None or val == "":
-            return 0.0
-        if isinstance(val, str) and val.strip().endswith("%"):
-            return float(val.strip().replace("%", ""))
-        return float(val)
-    except Exception:
-        return 0.0
 
 def load_brand() -> dict:
     try:
@@ -145,56 +108,27 @@ def load_brand() -> dict:
             "usps": ["Real materials", "Faster shipping", "Support that cares"],
         }
 
-def resolve_timeframe(use_all: bool, days_back: int | None, start_date: str | None, end_date: str | None):
-    """
-    Returns a tuple: (mode, params)
-      - mode = "all" or "range"
-      - params = {} or {"start": "YYYY-MM-DD", "end": "YYYY-MM-DD"}
-    """
-    if use_all:
-        return "all", {}
 
-    # explicit range wins if either bound provided
-    if start_date or end_date:
-        try:
-            if start_date:
-                sd = datetime.strptime(start_date, "%Y-%m-%d").date()
-            else:
-                sd = date(1970, 1, 1)
-            if end_date:
-                ed = datetime.strptime(end_date, "%Y-%m-%d").date()
-            else:
-                ed = date.today()
-            if sd > ed:
-                sd, ed = ed, sd  # swap if sent backwards
-            return "range", {"start": sd.isoformat(), "end": ed.isoformat()}
-        except ValueError:
-            # if formatting is wrong, just fall back to all
-            return "all", {}
+def to_float(val):
+    try:
+        if val is None or val == "":
+            return 0.0
+        if isinstance(val, str) and val.endswith("%"):
+            return float(val.replace("%", ""))
+        return float(val)
+    except Exception:
+        return 0.0
 
-    # days_back if provided
-    if days_back is not None and days_back > 0:
-        sd = (date.today() - timedelta(days=days_back - 1)).isoformat()
-        ed = date.today().isoformat()
-        return "range", {"start": sd, "end": ed}
-
-    # default: ALL data user has ingested
-    return "all", {}
-
-# ======================
-# Routes
-# ======================
+# --- Routes ---
 @app.get("/health")
 async def health():
     return {"status": "ok"}
 
+
 @app.post("/ingest_csv")
 async def ingest_csv(file: UploadFile = File(...)):
-    """
-    Upload a Meta CSV. We auto-detect a date column (e.g., Date/Day/Reporting Starts)
-    and store it into 'dte' (YYYY-MM-DD). If no date present, we stamp today.
-    """
-    if not file.filename.lower().endswith(".csv"):
+    """Upload a Meta CSV for *today*. Rows append into ad_metrics."""
+    if not file.filename.lower().endswith((".csv")):
         raise HTTPException(status_code=400, detail="Please upload a .csv file")
 
     raw = await file.read()
@@ -206,7 +140,7 @@ async def ingest_csv(file: UploadFile = File(...)):
     # Normalize headers
     df.rename(columns=META_RENAME, inplace=True)
 
-    # Ensure identifiers (support either Ad ID or Ad Name; create both)
+    # Ensure identifiers
     if "ad_id" not in df.columns and "ad_name" in df.columns:
         df["ad_id"] = df["ad_name"].astype(str)
     if "ad_name" not in df.columns and "ad_id" in df.columns:
@@ -214,33 +148,25 @@ async def ingest_csv(file: UploadFile = File(...)):
     df["ad_id"] = df.get("ad_id", "NA").fillna("NA").astype(str)
     df["ad_name"] = df.get("ad_name", df["ad_id"]).fillna("NA").astype(str)
 
-    # Optional text fields
+    # Optional common fields
     for col in ["campaign_name", "adset_name"]:
         if col not in df.columns:
             df[col] = ""
 
-    # Add missing metric columns and coerce numerics
+    # Create missing metric columns as 0
     for col in NUMERIC_COLS:
         if col not in df.columns:
             df[col] = 0
+
+    # Coerce numerics
+    for col in NUMERIC_COLS:
         df[col] = pd.to_numeric(df[col], errors="coerce").fillna(0)
 
-    # Resolve date column -> dte (ISO)
-    found = None
-    for cand in DATE_CANDIDATES:
-        if cand in df.columns:
-            found = cand
-            break
-
-    if found:
-        dser = pd.to_datetime(df[found], errors="coerce")
-        df["dte"] = dser.dt.date.astype(str)
-        # If any rows couldn't parse, fill with today
-        df["dte"] = df["dte"].where(~df["dte"].isna(), str(date.today()))
-    else:
+    # Add date column
+    if "dte" not in df.columns:
         df["dte"] = str(date.today())
 
-    # Keep only the columns we store
+    # Keep only known columns when writing
     keep_cols = [
         "dte", "ad_id", "ad_name", "campaign_name", "adset_name",
         "spend", "impressions", "ctr", "cpc", "hook_rate", "hold_rate",
@@ -248,29 +174,17 @@ async def ingest_csv(file: UploadFile = File(...)):
     ]
     df = df[[c for c in keep_cols if c in df.columns]]
 
-    try:
-        with engine.begin() as conn:
-            df.to_sql("ad_metrics", conn, if_exists="append", index=False)
-    except Exception as e:
-        raise HTTPException(status_code=500, detail=f"DB write error: {e}")
+    with engine.begin() as conn:
+        df.to_sql("ad_metrics", conn, if_exists="append", index=False)
 
     return {"status": "ok", "rows": int(len(df))}
 
+
 @app.post("/analyze")
 async def analyze(req: AnalyzeRequest):
-    # figure out the timeframe
-    mode, params = resolve_timeframe(req.use_all, req.days_back, req.start_date, req.end_date)
-
-    # read rows
+    today = str(date.today())
     with engine.begin() as conn:
-        if mode == "all":
-            df = pd.read_sql(text("SELECT * FROM ad_metrics"), conn)
-        else:
-            df = pd.read_sql(
-                text("SELECT * FROM ad_metrics WHERE date(dte) BETWEEN :start AND :end"),
-                conn,
-                params=params,
-            )
+        df = pd.read_sql(text("SELECT * FROM ad_metrics WHERE dte=:d"), conn, params={"d": today})
 
     if df.empty:
         return {
@@ -282,7 +196,6 @@ async def analyze(req: AnalyzeRequest):
                 "angle_mix": req.angle_mix,
                 "bans": req.bans,
             },
-            "window": {"mode": mode, **params},
         }
 
     # Ensure identifiers
@@ -291,7 +204,7 @@ async def analyze(req: AnalyzeRequest):
     if "ad_name" not in df.columns:
         df["ad_name"] = df["ad_id"]
 
-    # Aggregate per-ad across the selected window
+    # Aggregate per ad
     agg = (
         df.groupby("ad_id", as_index=False)
           .agg(
@@ -351,26 +264,19 @@ async def analyze(req: AnalyzeRequest):
             "angle_mix": req.angle_mix,
             "bans": req.bans,
         },
-        "window": {"mode": mode, **params},
     }
+
 
 @app.post("/diagnose")
 async def diagnose(req: DiagnoseRequest):
-    mode, params = resolve_timeframe(req.use_all, req.days_back, req.start_date, req.end_date)
-
+    today = str(date.today())
     with engine.begin() as conn:
-        if mode == "all":
-            df = pd.read_sql(text("SELECT * FROM ad_metrics"), conn)
-        else:
-            df = pd.read_sql(
-                text("SELECT * FROM ad_metrics WHERE date(dte) BETWEEN :start AND :end"),
-                conn,
-                params=params,
-            )
+        df = pd.read_sql(text("SELECT * FROM ad_metrics WHERE dte=:d"), conn, params={"d": today})
 
     if df.empty:
-        return {"message": "No data found in the selected window. Upload a CSV via /ingest_csv or widen the window."}
+        return {"message": "No data ingested today. Upload a CSV via /ingest_csv first."}
 
+    # Totals (use available columns)
     totals = {
         "spend": float(df.get("spend", pd.Series([0])).sum()),
         "impressions": int(df.get("impressions", pd.Series([0])).sum()),
@@ -380,6 +286,7 @@ async def diagnose(req: DiagnoseRequest):
         "avg_cpa": float(df.get("cpa", pd.Series([0])).mean()),
     }
 
+    # Simple weak-point logic
     issues = []
     if totals["avg_ctr"] < 1.0:
         issues.append("Low CTR (<1%): hooks/thumbnails not stopping scroll")
@@ -391,20 +298,15 @@ async def diagnose(req: DiagnoseRequest):
         issues.append(f"CPA above breakeven (>{BREAKEVEN_CPA_TRUE_AOV})")
 
     brand = load_brand()
+
+    # Claude-ready prompts (you paste into Claude)
     prompts = {
-        "hooks": (
-            "Write 10 scroll-stopping hooks (max 7 words) in the brand voice: "
-            f"{brand.get('brand_voice','')}. Target pains: {brand.get('avatars',[{}])[0].get('pains', [])}."
-        ),
-        "scripts": (
-            f"Draft 3x 30s UGC scripts using {brand.get('usps', [])} with curiosity opener → proof → CTA. "
-            "Include at least one objection-handle."
-        ),
+        "hooks": f"Write 10 scroll-stopping hooks (max 7 words) in the brand voice: {brand.get('brand_voice','')}. Target pains: {brand.get('avatars',[{}])[0].get('pains', [])}.",
+        "scripts": f"Draft 3x 30s UGC scripts using {brand.get('usps', [])} with curiosity opener → proof → CTA. Include at least one objection-handle.",
         "lp": "Suggest 5 trust-builders for the product page (microcopy, social proof, risk reversal, badges, reviews block).",
     }
 
     return {
-        "window": {"mode": mode, **params},
         "totals": totals,
         "weak_points": issues or ["No glaring issues vs targets; keep scaling tests running."],
         "recommendations": [
@@ -415,12 +317,15 @@ async def diagnose(req: DiagnoseRequest):
         "claude_prompts": prompts,
     }
 
+
 @app.get("/brand")
 async def get_brand():
     return load_brand()
 
+
 class UpdateBrandRequest(BaseModel):
     brand: dict
+
 
 @app.post("/update_brand_knowledge")
 async def update_brand_knowledge(req: UpdateBrandRequest):
@@ -430,3 +335,6 @@ async def update_brand_knowledge(req: UpdateBrandRequest):
         return {"status": "ok"}
     except Exception as e:
         raise HTTPException(status_code=500, detail=str(e))
+
+# (No need for if __name__ == "__main__": as Render runs uvicorn directly)
+
