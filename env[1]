@@ -1,0 +1,14 @@
+# DO NOT COMMIT THIS FILE
+# Fill these in locally, and paste each line into Render's Environment tab (one per row).
+
+OPENAI_API_KEY=
+ANTHROPIC_API_KEY=
+DATABASE_URL=sqlite:///erto_agent.db
+
+TARGET_ROAS=2.54
+BREAKEVEN_ROAS=1.54
+TARGET_CPA=39.30
+BREAKEVEN_CPA_TRUE_AOV=81.56
+BREAKEVEN_CPA_BUY1=65.50
+TARGET_CVR=4.2
+EXPERT_MODE=ON
