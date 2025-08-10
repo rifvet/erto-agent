@@ -1,20 +1,21 @@
-import os
 import io
+import os
 import json
-import math
-from datetime import datetime
+import traceback
 from typing import Optional, List, Dict, Any
 
 import pandas as pd
-from fastapi import FastAPI, UploadFile, File, HTTPException
+from fastapi import FastAPI, File, UploadFile, HTTPException
 from fastapi.middleware.cors import CORSMiddleware
-from fastapi.responses import JSONResponse, PlainTextResponse, HTMLResponse
+from fastapi.responses import JSONResponse, HTMLResponse
 from pydantic import BaseModel
 from sqlalchemy import create_engine, text
-from sqlalchemy.engine import Engine
 
-APP_TITLE = "ERTO Agent"
-APP_VERSION = "1.8.0"
+# ---------------------------
+# App & settings
+# ---------------------------
+APP_TITLE = "Erto Agent"
+APP_VERSION = "0.6.0"
 
 app = FastAPI(title=APP_TITLE, version=APP_VERSION)
 
@@ -25,233 +26,357 @@ app.add_middleware(
     allow_headers=["*"],
 )
 
-# ---------------------------
-# Globals
-# ---------------------------
-_last_error: Dict[str, Any] = {"error": None}
-def set_last_error(msg: str, detail: Any = None):
-    global _last_error
-    _last_error = {"error": msg, "detail": detail, "ts": datetime.utcnow().isoformat()+"Z"}
+# Simple SQLite (file on disk). If you have a DATABASE_URL, the app will use it.
+DB_URL = os.environ.get("DATABASE_URL", "sqlite:///metrics.db")
+engine = create_engine(DB_URL, future=True)
+
+LAST_ERROR: str = ""
 
 # ---------------------------
-# DB (SQLite fallback)
+# Helpers
 # ---------------------------
-def get_engine() -> Engine:
-    url = os.environ.get("DATABASE_URL", "").strip()
-    if not url:
-        url = "sqlite:///./ad_metrics.db"
-    if url.startswith("postgres://"):
-        url = url.replace("postgres://", "postgresql+psycopg2://", 1)
-    return create_engine(url, future=True)
 
-ENGINE = get_engine()
-with ENGINE.begin() as conn:
-    conn.execute(text("""
-        CREATE TABLE IF NOT EXISTS ad_metrics (
-            date TEXT,
-            campaign TEXT,
-            adset TEXT,
-            ad_name TEXT,
-            spend REAL,
-            purchases REAL,
-            roas REAL,
-            cpr REAL,
-            clicks REAL,
-            reach REAL,
-            ctr REAL,
-            hook_rate REAL,
-            hold_rate REAL,
-            cpc REAL,
-            cpm REAL,
-            frequency REAL,
-            atc REAL,
-            checkout REAL,
-            avg_play_time REAL,
-            raw JSON
-        )
-    """))
+def set_last_error(e: Exception):
+    global LAST_ERROR
+    LAST_ERROR = "".join(traceback.format_exception(type(e), e, e.__traceback__))
 
-# ---------------------------
-# CSV utils
-# ---------------------------
-def read_csv_upload(file: UploadFile) -> pd.DataFrame:
+def read_uploaded_csv(file: UploadFile) -> pd.DataFrame:
+    # Read the bytes and let pandas sniff; Meta exports often contain BOM and mixed types
+    raw_bytes = file.file.read()
+    if not raw_bytes:
+        raise ValueError("Empty file upload.")
+
+    bio = io.BytesIO(raw_bytes)
     try:
-        content = file.file.read()
-        return pd.read_csv(io.BytesIO(content), encoding_errors="replace", engine="python")
-    except Exception as e:
-        raise HTTPException(status_code=400, detail=f"Could not read CSV: {e}")
+        df = pd.read_csv(
+            bio,
+            dtype=str,            # read everything as text first (avoids dtype conflicts)
+            keep_default_na=False # keep empty strings rather than NaN initially
+        )
+    except Exception:
+        # Some Meta exports are semicolon-delimited; try again
+        bio.seek(0)
+        df = pd.read_csv(bio, dtype=str, keep_default_na=False, sep=";")
+
+    # Trim header whitespace
+    df.columns = [c.strip() for c in df.columns]
+    return df
+
+
+def coerce_numeric(s: pd.Series) -> pd.Series:
+    # Remove commas, percent signs, currency, and cast
+    return pd.to_numeric(
+        s.astype(str)
+         .str.replace(",", "", regex=False)
+         .str.replace("$", "", regex=False)
+         .str.replace("%", "", regex=False)
+         .str.strip(),
+        errors="coerce"
+    )
+
+
+def pct_to_ratio(series: pd.Series) -> pd.Series:
+    """Meta sometimes reports CTR etc. as percentages (e.g., 3.2) not 0.032.
+       Heuristic: values > 1.5 are likely percentages. Convert to 0-1 ratios.
+    """
+    x = coerce_numeric(series)
+    return pd.Series(
+        [v/100.0 if pd.notna(v) and v > 1.5 else v for v in x],
+        index=series.index
+    )
+
 
 def normalize_columns(df: pd.DataFrame) -> pd.DataFrame:
-    # map MANY possible Meta export headers -> our canonical names
-    mapping = {
-        "ad name": "ad_name", "ad": "ad_name",
-        "ad set name": "adset", "adset name": "adset", "adset": "adset",
-        "campaign name": "campaign", "campaign": "campaign",
-        "day": "date", "reporting starts": "date_start", "reporting ends": "date_end",
+    """Map many possible Meta column names into a canonical schema we use downstream."""
+    colmap = {
+        # idents
+        "ad name": "ad_name",
+        "ad set name": "adset_name",
+        "adset name": "adset_name",
+        "campaign name": "campaign_name",
 
-        "amount spent (usd)": "spend", "spend": "spend",
+        # dates
+        "day": "dte",
+        "reporting starts": "reporting_starts",
+        "reporting ends": "reporting_ends",
 
-        "website purchases": "purchases", "purchases": "purchases",
-
-        # ROAS / CPR / CPA
-        "purchase roas (return on ad spend)": "roas",
-        "website purchase roas (return on advertising spend)": "roas",
-        "roas": "roas",
-        "cost per purchase": "cpr",
-        "cost per result": "cpr",  # treat CPA as CPR on Meta like you asked
-
-        # Clicks / CTR
-        "link clicks": "clicks", "clicks": "clicks",
-        "ctr (link click-through rate)": "ctr", "ctr": "ctr",
-        "cpc (cost per link click)": "cpc", "cpc": "cpc",
-
-        # CPM / Frequency
-        "cpm (cost per 1,000 impressions)": "cpm", "cpm": "cpm",
-        "frequency": "frequency",
-
-        # Creative quality
-        "hook rate": "hook_rate", "hold rate": "hold_rate",
-        "video average play time": "avg_play_time",
-
-        # Funnel steps
-        "adds to cart": "atc", "website adds to cart": "atc",
-        "checkouts initiated": "checkout", "website checkouts initiated": "checkout",
-
-        # misc
-        "reach": "reach",
-        "result type": "result_type",
+        # delivery
         "delivery status": "delivery_status",
         "delivery level": "delivery_level",
+
+        # spend metrics
+        "amount spent (usd)": "spend",
+        "purchase roas (return on ad spend)": "roas_purchase",
+        "website purchase roas (return on advertising spend)": "roas_purchase_web",
+        "cost per purchase": "cpr_purchase",
+        "cost per result": "cpr",  # Meta CPR
+
+        # engagement funnel
+        "ctr (link click-through rate)": "ctr",
+        "link clicks": "clicks",
+        "adds to cart": "atc",
+        "website adds to cart": "atc_web",
+        "checkouts initiated": "checkout",
+        "website checkouts initiated": "checkout_web",
+        "purchases": "purchases",
+        "website purchases": "purchases_web",
+
+        # cost/impressions
+        "cpc (cost per link click)": "cpc",
+        "cpm (cost per 1,000 impressions)": "cpm",
+        "reach": "reach",
+        "frequency": "frequency",
+
+        # creative quality
+        "hook rate": "hook_rate",
+        "hold rate": "hold_rate",
+        "video average play time": "avg_play_time",
     }
 
-    renames = {}
-    for c in df.columns:
-        key = c.strip().lower()
-        if key in mapping:
-            renames[c] = mapping[key]
-    df = df.rename(columns=renames)
+    lower = {c.lower(): c for c in df.columns}
+    canonical: Dict[str, str] = {}
+    for k, v in colmap.items():
+        if k in lower:
+            canonical[lower[k]] = v
 
-    # Ensure date
-    if "date" not in df.columns:
-        if "date_start" in df.columns: df["date"] = df["date_start"]
-        elif "Day" in df.columns: df["date"] = df["Day"]
-        elif "Reporting starts" in df.columns: df["date"] = df["Reporting starts"]
+    df2 = df.rename(columns=canonical).copy()
 
-    # Numerics
-    numeric = ["spend","purchases","roas","cpr","clicks","reach","ctr","hook_rate","hold_rate",
-               "cpc","cpm","frequency","atc","checkout","avg_play_time"]
-    for c in numeric:
-        if c in df.columns:
-            df[c] = pd.to_numeric(df[c], errors="coerce")
+    # Make sure key fields exist
+    for needed in ["ad_name", "spend"]:
+        if needed not in df2.columns:
+            # create empty if missing (we'll still parse what we can)
+            df2[needed] = ""
 
-    # CTR sometimes exported as %
-    if "ctr" in df.columns and (df["ctr"].dropna() > 1).any():
-        df["ctr"] = df["ctr"]/100.0
+    # Dates
+    for dcol in ["dte", "reporting_starts", "reporting_ends"]:
+        if dcol in df2.columns:
+            df2[dcol] = pd.to_datetime(df2[dcol], errors="coerce").dt.date
 
-    # Date parse
-    if "date" in df.columns:
-        df["date"] = pd.to_datetime(df["date"], errors="coerce").dt.date
+    # Numerics / ratios
+    if "spend" in df2.columns:
+        df2["spend"] = coerce_numeric(df2["spend"]).fillna(0)
 
-    # Defaults
-    for c in ["spend","purchases","clicks","reach","roas","cpr","hook_rate","hold_rate","atc","checkout"]:
-        if c in df.columns: df[c] = df[c].fillna(0)
+    # pick ROAS
+    roas = None
+    if "roas_purchase_web" in df2:
+        roas = coerce_numeric(df2["roas_purchase_web"])
+    elif "roas_purchase" in df2:
+        roas = coerce_numeric(df2["roas_purchase"])
+    if roas is not None:
+        df2["roas"] = roas.fillna(0)
+    else:
+        df2["roas"] = 0.0
 
-    for c in ["ad_name","adset","campaign"]:
-        if c in df.columns: df[c] = df[c].astype(str)
+    # Cost per purchase (CPR) -> your CPA equivalent
+    if "cpr_purchase" in df2:
+        df2["cpr_purchase"] = coerce_numeric(df2["cpr_purchase"])
+    else:
+        df2["cpr_purchase"] = pd.NA
 
+    # Generic CPR from Meta if present
+    if "cpr" in df2:
+        df2["cpr"] = coerce_numeric(df2["cpr"])
+    else:
+        df2["cpr"] = pd.NA
+
+    # CPC/CPM/Frequency
+    for col in ["cpc", "cpm", "frequency", "avg_play_time"]:
+        if col in df2:
+            df2[col] = coerce_numeric(df2[col])
+
+    # CTR/hook/hold to ratios
+    if "ctr" in df2:
+        df2["ctr"] = pct_to_ratio(df2["ctr"]).fillna(0)
+    for col in ["hook_rate", "hold_rate"]:
+        if col in df2:
+            # these often come as ratios already; still coerce
+            df2[col] = coerce_numeric(df2[col]).fillna(0)
+
+    # funnel counts
+    for col in ["clicks", "atc", "atc_web", "checkout", "checkout_web", "purchases", "purchases_web", "reach"]:
+        if col in df2:
+            df2[col] = coerce_numeric(df2[col]).fillna(0)
+
+    # choose website-first where available
+    if "atc_web" in df2:
+        df2["atc_eff"] = df2["atc_web"]
+    else:
+        df2["atc_eff"] = df2.get("atc", pd.Series(0, index=df2.index))
+
+    if "checkout_web" in df2:
+        df2["checkout_eff"] = df2["checkout_web"]
+    else:
+        df2["checkout_eff"] = df2.get("checkout", pd.Series(0, index=df2.index))
+
+    if "purchases_web" in df2:
+        df2["purchases_eff"] = df2["purchases_web"]
+    else:
+        df2["purchases_eff"] = df2.get("purchases", pd.Series(0, index=df2.index))
+
+    # derive CVR and fallback CPR
+    clicks = df2.get("clicks", pd.Series(0, index=df2.index))
+    purchases = df2.get("purchases_eff", pd.Series(0, index=df2.index))
+    df2["cvr"] = (purchases / clicks.replace(0, pd.NA)).fillna(0.0)
+
+    # If CPR purchase missing, derive spend / purchases
+    df2["cpr_eff"] = df2["cpr_purchase"]
+    mask_missing = df2["cpr_eff"].isna() & (purchases > 0)
+    df2.loc[mask_missing, "cpr_eff"] = (df2.loc[mask_missing, "spend"] / purchases.loc[mask_missing])
+
+    # Fallback to Meta CPR (often cost per result)
+    df2["cpr_eff"] = df2["cpr_eff"].fillna(df2["cpr"])
+
+    return df2
+
+
+def ensure_table_exists():
+    with engine.begin() as conn:
+        conn.execute(
+            text("""
+            CREATE TABLE IF NOT EXISTS ad_metrics (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                ad_name TEXT,
+                adset_name TEXT,
+                campaign_name TEXT,
+                dte DATE,
+                reporting_starts DATE,
+                reporting_ends DATE,
+                delivery_status TEXT,
+                delivery_level TEXT,
+                spend REAL,
+                roas REAL,
+                cpr_eff REAL,
+                ctr REAL,
+                clicks REAL,
+                atc_eff REAL,
+                checkout_eff REAL,
+                purchases_eff REAL,
+                cpc REAL,
+                cpm REAL,
+                reach REAL,
+                frequency REAL,
+                hook_rate REAL,
+                hold_rate REAL,
+                avg_play_time REAL
+            )
+            """)
+        )
+
+
+def append_to_db(df: pd.DataFrame):
+    ensure_table_exists()
+    cols = [
+        "ad_name","adset_name","campaign_name","dte","reporting_starts","reporting_ends",
+        "delivery_status","delivery_level","spend","roas","cpr_eff","ctr","clicks","atc_eff",
+        "checkout_eff","purchases_eff","cpc","cpm","reach","frequency","hook_rate","hold_rate","avg_play_time"
+    ]
+    for c in cols:
+        if c not in df.columns:
+            df[c] = pd.NA
+    df[cols].to_sql("ad_metrics", engine, if_exists="append", index=False)
+
+
+def load_metrics() -> pd.DataFrame:
+    ensure_table_exists()
+    with engine.begin() as conn:
+        df = pd.read_sql(text("SELECT * FROM ad_metrics"), conn)
+    # Coerce types again when reading from DB (SQLite is loose)
+    for c in ["spend","roas","cpr_eff","ctr","clicks","atc_eff","checkout_eff","purchases_eff","cpc","cpm","reach","frequency","hook_rate","hold_rate","avg_play_time"]:
+        if c in df: df[c] = pd.to_numeric(df[c], errors="coerce").fillna(0.0)
     return df
 
-def safe_div(a: float, b: float) -> float:
-    try:
-        a = float(a or 0)
-        b = float(b or 0)
-    except Exception:
+
+def score_ratio(value: float, target: float) -> float:
+    if target is None or target <= 0:
         return 0.0
-    if b <= 0: return 0.0
-    return a / b
+    if value is None:
+        return 0.0
+    return max(0.0, min(value / target, 1.0))
 
-def compute_row_metrics(df: pd.DataFrame) -> pd.DataFrame:
-    # CPR fallback if missing but we have spend & purchases
-    if "cpr" not in df.columns:
-        df["cpr"] = 0.0
-    if "purchases" in df.columns and "spend" in df.columns:
-        mask = (df["cpr"].fillna(0) == 0) & (df["purchases"].fillna(0) > 0)
-        df.loc[mask, "cpr"] = df.loc[mask, "spend"] / df.loc[mask, "purchases"]
 
-    # Stage rates at row-level (will re-compute after aggregation as well)
-    df["cvr"] = df.apply(lambda r: safe_div(r.get("purchases",0), r.get("clicks",0)), axis=1)  # Purchases / Clicks
-    df["atc_rate"] = df.apply(lambda r: safe_div(r.get("atc",0), r.get("clicks",0)), axis=1)
-    df["checkout_rate"] = df.apply(lambda r: safe_div(r.get("checkout",0), r.get("atc",0)), axis=1)
-    df["purchase_rate"] = df.apply(lambda r: safe_div(r.get("purchases",0), r.get("checkout",0)), axis=1)
-    return df
+def score_inverse(value: float, target: float) -> float:
+    # lower is better
+    if target is None or target <= 0:
+        return 0.0
+    if value is None or value <= 0:
+        return 1.0  # free pass if zero cost/frequency
+    return max(0.0, min(target / value, 1.0))
 
-def aggregate_by_ad(df: pd.DataFrame) -> pd.DataFrame:
-    if "ad_name" not in df.columns:
-        df["ad_name"] = df.get("adset", df.get("campaign", "UNKNOWN"))
-    agg = {
-        "spend":"sum","purchases":"sum","clicks":"sum","reach":"sum","atc":"sum","checkout":"sum",
-        "roas":"mean","cpr":"mean","ctr":"mean","hook_rate":"mean","hold_rate":"mean",
-        "cpc":"mean","cpm":"mean","frequency":"mean","avg_play_time":"mean",
+
+def growth_score(row: pd.Series, cfg: "AnalyzeConfig") -> float:
+    s = 0.0
+    s += cfg.w_roas * score_ratio(row.get("roas", 0.0), max(cfg.roas_to_scale, 1e-6))
+    s += cfg.w_ctr  * score_ratio(row.get("ctr", 0.0), cfg.target_ctr or 0.015)
+    s += cfg.w_hook * score_ratio(row.get("hook_rate", 0.0), cfg.target_hook or 0.30)
+    s += cfg.w_hold * score_ratio(row.get("hold_rate", 0.0), cfg.target_hold or 0.25)
+    s += cfg.w_cvr  * score_ratio(row.get("cvr", 0.0), cfg.target_cvr or 0.02)
+    s += cfg.w_spend* score_ratio(row.get("spend", 0.0), max(cfg.min_spend_for_iterate, 1.0))
+    s += cfg.w_cpc  * score_inverse(row.get("cpc", 0.0), cfg.target_cpc or 1.50)
+    s += cfg.w_cpm  * score_inverse(row.get("cpm", 0.0), cfg.target_cpm or 25.0)
+    s += cfg.w_freq * score_inverse(row.get("frequency", 0.0), cfg.max_frequency or 2.5)
+    return round(float(s), 4)
+
+
+def funnel_diagnostics(row: pd.Series, cfg: "AnalyzeConfig") -> Dict[str, Any]:
+    clicks = float(row.get("clicks", 0.0))
+    atc    = float(row.get("atc_eff", 0.0))
+    chk    = float(row.get("checkout_eff", 0.0))
+    pur    = float(row.get("purchases_eff", 0.0))
+    ctr    = float(row.get("ctr", 0.0))
+    hook   = float(row.get("hook_rate", 0.0))
+    hold   = float(row.get("hold_rate", 0.0))
+
+    def safe_rate(num, den): 
+        return 0.0 if den <= 0 else num/den
+
+    atc_rate      = safe_rate(atc, clicks)
+    checkout_rate = safe_rate(chk, atc)
+    purchase_rate = safe_rate(pur, chk)
+
+    issues: List[str] = []
+
+    # Top-of-funnel creative
+    if ctr < (cfg.target_ctr or 0.015) * 0.7 or hook < (cfg.target_hook or 0.30) * 0.7:
+        issues.append("Creative hook/CTR weak — consider stronger first 2s, clearer thumbstop, and reframe benefits.")
+    elif hold < (cfg.target_hold or 0.25) * 0.7:
+        issues.append("Audience is stopping early — tighten pacing, pattern breaks around 3–5s, restate promise.")
+
+    # Mid-funnel (LP trust/clarity)
+    if atc_rate < 0.10 and clicks >= 50:
+        issues.append("Low Click→ATC: landing page likely not conveying value or trust; test offer framing & social proof.")
+
+    # Checkout friction
+    if checkout_rate < 0.35 and atc >= 10:
+        issues.append("Low ATC→Checkout start: cart friction (shipping surprises, page lag) — streamline steps.")
+
+    # Final intent
+    if purchase_rate < 0.4 and chk >= 10:
+        issues.append("Low Checkout→Purchase: trust & urgency lacking — add guarantees, testimonials, limited-time nudge.")
+
+    # Frequency fatigue
+    if float(row.get("frequency", 0.0)) > (cfg.max_frequency or 2.5) and ctr < (cfg.target_ctr or 0.015):
+        issues.append("High frequency with weak CTR — rotate creatives and/or tighten audience.")
+
+    return {
+        "ctr": ctr, "hook_rate": hook, "hold_rate": hold,
+        "atc_rate": atc_rate, "checkout_rate": checkout_rate, "purchase_rate": purchase_rate,
+        "notes": issues
     }
-    agg = {k:v for k,v in agg.items() if k in df.columns}
-    g = df.groupby(["ad_name"], dropna=False).agg(agg).reset_index()
 
-    # Stage rates after aggregation
-    g["cvr"] = g.apply(lambda r: safe_div(r.get("purchases",0), r.get("clicks",0)), axis=1)
-    g["atc_rate"] = g.apply(lambda r: safe_div(r.get("atc",0), r.get("clicks",0)), axis=1)
-    g["checkout_rate"] = g.apply(lambda r: safe_div(r.get("checkout",0), r.get("atc",0)), axis=1)
-    g["purchase_rate"] = g.apply(lambda r: safe_div(r.get("purchases",0), r.get("checkout",0)), axis=1)
-    return g
-
-def safe_to_sql(df: pd.DataFrame, table="ad_metrics"):
-    raw_cols = list(df.columns)
-    rows = []
-    for _, r in df.iterrows():
-        rows.append({
-            "date": str(r.get("date")) if not pd.isna(r.get("date")) else None,
-            "campaign": r.get("campaign"),
-            "adset": r.get("adset"),
-            "ad_name": r.get("ad_name"),
-            "spend": float(r.get("spend",0) or 0),
-            "purchases": float(r.get("purchases",0) or 0),
-            "roas": float(r.get("roas",0) or 0),
-            "cpr": float(r.get("cpr",0) or 0),
-            "clicks": float(r.get("clicks",0) or 0),
-            "reach": float(r.get("reach",0) or 0),
-            "ctr": float(r.get("ctr",0) or 0),
-            "hook_rate": float(r.get("hook_rate",0) or 0),
-            "hold_rate": float(r.get("hold_rate",0) or 0),
-            "cpc": float(r.get("cpc",0) or 0),
-            "cpm": float(r.get("cpm",0) or 0),
-            "frequency": float(r.get("frequency",0) or 0),
-            "atc": float(r.get("atc",0) or 0),
-            "checkout": float(r.get("checkout",0) or 0),
-            "avg_play_time": float(r.get("avg_play_time",0) or 0),
-            "raw": json.dumps({c:(None if pd.isna(r.get(c)) else r.get(c)) for c in raw_cols}),
-        })
-    if rows:
-        pd.DataFrame(rows).to_sql(table, ENGINE, if_exists="append", index=False)
 
 # ---------------------------
 # Schemas
 # ---------------------------
-class AnalyzeParams(BaseModel):
-    # decision thresholds
+
+class AnalyzeConfig(BaseModel):
+    # thresholds
     min_spend_for_scale: float = 50.0
     min_spend_for_iterate: float = 20.0
     roas_to_scale: float = 2.0
-    kill_if_roas_below: float = 0.9
-
-    # CPR target (Meta). `target_cpa` kept for backward-compat.
-    target_cpr: Optional[float] = None
-    target_cpa: Optional[float] = None  # alias
-
+    target_cpr: Optional[float] = None  # your CPA target (Meta CPR)
     require_cvr: bool = False
     min_cvr: float = 0.0
-    lookback_days: Optional[int] = None
-
-    # growth-score targets
-    target_roas: float = 2.0
+    # targets for scoring/diagnostics
     target_ctr: float = 0.015
     target_hook: float = 0.30
     target_hold: float = 0.25
@@ -259,8 +384,7 @@ class AnalyzeParams(BaseModel):
     target_cpc: float = 1.50
     target_cpm: float = 25.0
     max_frequency: float = 2.5
-
-    # growth-score weights (don’t need to sum to 1; we cap)
+    # weights for GrowthScore
     w_roas: float = 0.30
     w_ctr: float = 0.12
     w_hook: float = 0.12
@@ -271,91 +395,58 @@ class AnalyzeParams(BaseModel):
     w_cpm: float = 0.05
     w_freq: float = 0.05
 
-    # potential winners band
-    potential_min_spend: float = 10.0
-    potential_max_spend: float = 50.0
-    potential_score_threshold: float = 55.0  # 0-100
 
-class ActionItem(BaseModel):
-    ad_id: str
-    name: str
-    spend: float
-    roas: float
-    cpr: float
-    cvr: float
-    ctr: float = 0.0
-    hook_rate: float = 0.0
-    hold_rate: float = 0.0
-    atc_rate: float = 0.0
-    checkout_rate: float = 0.0
-    purchase_rate: float = 0.0
-    probability_to_grow: float = 0.0  # 0-100
-    reason: str
+class CoachAnswers(BaseModel):
+    answers: str
 
-class CreativeGaps(BaseModel):
-    needed_new_creatives: int
-    angle_mix: Dict[str, int]
-    bans: List[str] = []
 
-class FunnelReport(BaseModel):
-    stage_rates: Dict[str, float]
-    biggest_bottleneck: str
-    probable_causes: List[str]
-    recommended_experiments: List[str]
+class PromptLabReq(BaseModel):
+    target: str = "Meta"
+    context: str = ""
 
-class PerAdIssue(BaseModel):
-    ad_id: str
-    name: str
-    stage_bottleneck: str
-    evidence: Dict[str, float]
-    hypothesis: str
-    experiments: List[str]
 
-class AnalyzeResponse(BaseModel):
-    scale: List[ActionItem]
-    kill: List[ActionItem]
-    iterate: List[ActionItem]
-    potential_winners: List[ActionItem]
-    creative_gaps: CreativeGaps
-    top_by_growth: List[ActionItem]
-    account_diagnostics: FunnelReport
-    per_ad_issues: List[PerAdIssue]
+class ScriptReq(BaseModel):
+    platform: str = "Meta"
+    target_seconds: Optional[int] = None
+    script: str
+
 
 # ---------------------------
-# Root (dark UI) + Debug
+# UI (no f-string!)
 # ---------------------------
+
 @app.get("/", response_class=HTMLResponse)
 def home():
-    return f"""
+    html = """
 <!doctype html>
 <html>
 <head>
 <meta charset="utf-8"/><meta name="viewport" content="width=device-width,initial-scale=1"/>
-<title>{APP_TITLE}</title>
+<title>__TITLE__</title>
 <style>
-  :root {{ color-scheme: dark; }}
-  body {{ margin:0; background:#0b0f17; color:#e6edf3; font-family: ui-sans-serif,system-ui,Segoe UI,Roboto,Arial; }}
-  header {{ padding:16px 20px; border-bottom:1px solid #1f2633; display:flex; gap:12px; align-items:center; }}
-  .badge {{ font-size:12px; padding:4px 8px; background:#1f2633; border-radius:999px; }}
-  main {{ padding:20px; max-width:1100px; margin:0 auto; }}
-  section {{ border:1px solid #1f2633; border-radius:12px; padding:16px; margin:18px 0; background:#0e1420; }}
-  h2 {{ margin:0 0 12px; font-size:18px; }}
-  input, button, textarea {{ background:#0b0f17; color:#e6edf3; border:1px solid #263045; padding:8px 10px; border-radius:8px; }}
-  textarea {{ width:100%; }}
-  button {{ cursor:pointer; }}
-  pre {{ background:#0b0f17; border:1px solid #1f2633; padding:12px; border-radius:8px; overflow:auto; }}
-  .row {{ display:flex; gap:10px; align-items:center; flex-wrap:wrap; }}
-  .tabs {{ display:flex; gap:8px; margin-bottom:8px; }}
-  .tab {{ padding:6px 10px; border:1px solid #263045; border-radius:8px; cursor:pointer; }}
-  .active {{ background:#101a2a; }}
-  .hide {{ display:none; }}
-  label.inline {{ display:flex; gap:6px; align-items:center; }}
+  :root { color-scheme: dark; }
+  body { margin:0; background:#0b0f17; color:#e6edf3; font-family: ui-sans-serif,system-ui,Segoe UI,Roboto,Arial; }
+  header { padding:16px 20px; border-bottom:1px solid #1f2633; display:flex; gap:12px; align-items:center; }
+  .badge { font-size:12px; padding:4px 8px; background:#1f2633; border-radius:999px; }
+  main { padding:20px; max-width:1100px; margin:0 auto; }
+  section { border:1px solid #1f2633; border-radius:12px; padding:16px; margin:18px 0; background:#0e1420; }
+  h2 { margin:0 0 12px; font-size:18px; }
+  input, button, textarea { background:#0b0f17; color:#e6edf3; border:1px solid #263045; padding:8px 10px; border-radius:8px; }
+  textarea { width:100%; }
+  button { cursor:pointer; }
+  pre { background:#0b0f17; border:1px solid #1f2633; padding:12px; border-radius:8px; overflow:auto; white-space:pre-wrap; }
+  .row { display:flex; gap:10px; align-items:center; flex-wrap:wrap; }
+  .tabs { display:flex; gap:8px; margin-bottom:8px; }
+  .tab { padding:6px 10px; border:1px solid #263045; border-radius:8px; cursor:pointer; }
+  .active { background:#101a2a; }
+  .hide { display:none; }
+  label.inline { display:flex; gap:6px; align-items:center; }
 </style>
 </head>
 <body>
 <header>
-  <strong>ERTO Agent</strong>
-  <span class="badge">v{APP_VERSION} • dark</span>
+  <strong>__TITLE__</strong>
+  <span class="badge">v__VERSION__ • dark</span>
   <a href="/docs" style="margin-left:auto;color:#8fb3ff">OpenAPI Docs →</a>
 </header>
 <main>
@@ -443,14 +534,17 @@ def home():
 
 <script>
 function show(id){
-  for (const s of ['ingest','analyze','coach','prompt','script']){
+  ['ingest','analyze','coach','prompt','script'].forEach(s => {
     document.getElementById(s).classList.add('hide');
-  }
+  });
   document.getElementById(id).classList.remove('hide');
-  for (const el of document.querySelectorAll('.tab')) el.classList.remove('active');
+
+  const tabs = document.querySelectorAll('.tab');
+  tabs.forEach(t => t.classList.remove('active'));
   const idx = ['ingest','analyze','coach','prompt','script'].indexOf(id);
-  document.querySelectorAll('.tab')[idx].classList.add('active');
+  if (idx >= 0) tabs[idx].classList.add('active');
 }
+
 async function ingest(){
   const f = document.getElementById('csvfile').files[0];
   if(!f){ alert('Pick a CSV first'); return; }
@@ -518,231 +612,312 @@ async function analyzeScript(){
 </script>
 </body>
 </html>
-    """
-
-@app.get("/debug/last_error")
-def last_error():
-    return JSONResponse(_last_error)
+"""
+    return HTMLResponse(html.replace("__TITLE__", APP_TITLE).replace("__VERSION__", APP_VERSION))
 
 # ---------------------------
-# Ingest
+# Ingest endpoints
 # ---------------------------
-@app.post("/ingest_csv_debug")
-async def ingest_csv_debug(file: UploadFile = File(...)):
-    try:
-        df = read_csv_upload(file)
-        df = normalize_columns(df)
-        df = compute_row_metrics(df)
-        sample = df.head(5).fillna("").astype(str).to_dict(orient="records")
-        dtypes = {c: str(df[c].dtype) for c in df.columns}
-        return JSONResponse({"columns": list(df.columns), "dtypes": dtypes, "sample": sample})
-    except Exception as e:
-        set_last_error("ingest_csv_debug failed", str(e)); raise
 
 @app.post("/ingest_csv")
 async def ingest_csv(file: UploadFile = File(...)):
     try:
-        df = read_csv_upload(file)
-        df = normalize_columns(df)
-        df = compute_row_metrics(df)
-        safe_to_sql(df)
-        return PlainTextResponse(f"OK: {len(df)} rows ingested into ad_metrics")
+        df_raw = read_uploaded_csv(file)
+        df = normalize_columns(df_raw)
+        # If no day column given, try use reporting_starts
+        if "dte" not in df.columns or df["dte"].isna().all():
+            df["dte"] = df.get("reporting_starts", pd.NaT)
+
+        append_to_db(df)
+        return {"status": "ok", "rows_written": int(len(df))}
     except Exception as e:
-        set_last_error("ingest_csv failed", str(e))
-        raise HTTPException(status_code=500, detail="Server failed to ingest CSV. Hit /debug/last_error for details.")
+        set_last_error(e)
+        return JSONResponse(
+            status_code=500,
+            content={"detail": "Server failed to ingest CSV. Hit /debug/last_error for details."}
+        )
 
-# ---------------------------
-# Analyze helpers
-# ---------------------------
-def _norm_higher_better(x: float, target: float, cap_multiple: float = 2.0) -> float:
-    if target <= 0: return 0.0
-    r = max(0.0, min(x/target, cap_multiple))
-    return r / cap_multiple
 
-def _norm_lower_better(x: float, target: float) -> float:
-    if target <= 0: return 0.0
-    # 1.0 at or below target; decays as it gets worse
-    r = target / max(x, target)
-    return max(0.0, min(r, 1.0))
-
-def _spend_factor(spend: float, min_spend_for_scale: float) -> float:
-    if min_spend_for_scale <= 0: return 0.0
-    return max(0.0, min(1.0, spend / min_spend_for_scale))
-
-def growth_score(row: pd.Series, p: AnalyzeParams) -> float:
-    roas = float(row.get("roas",0) or 0)
-    ctr  = float(row.get("ctr",0) or 0)
-    hook = float(row.get("hook_rate",0) or 0)
-    hold = float(row.get("hold_rate",0) or 0)
-    cvr  = float(row.get("cvr",0) or 0)
-    spend= float(row.get("spend",0) or 0)
-    cpc  = float(row.get("cpc",0) or 0)
-    cpm  = float(row.get("cpm",0) or 0)
-    freq = float(row.get("frequency",0) or 0)
-
-    score = (
-        p.w_roas * _norm_higher_better(roas, p.target_roas) +
-        p.w_ctr  * _norm_higher_better(ctr,  p.target_ctr)  +
-        p.w_hook * _norm_higher_better(hook, p.target_hook) +
-        p.w_hold * _norm_higher_better(hold, p.target_hold) +
-        p.w_cvr  * _norm_higher_better(cvr,  p.target_cvr)  +
-        p.w_spend* _spend_factor(spend, p.min_spend_for_scale) +
-        p.w_cpc  * _norm_lower_better(cpc if cpc>0 else p.target_cpc, p.target_cpc) +
-        p.w_cpm  * _norm_lower_better(cpm if cpm>0 else p.target_cpm, p.target_cpm) +
-        p.w_freq * (1.0 if freq==0 else _norm_lower_better(freq, p.max_frequency))
-    )
-    return round(100.0 * max(0.0, min(score, 1.0)), 2)
-
-def mk_item(row: pd.Series, reason: str, prob: float) -> ActionItem:
-    return ActionItem(
-        ad_id=str(row["ad_name"]),
-        name=str(row["ad_name"]),
-        spend=float(row.get("spend",0) or 0),
-        roas=float(row.get("roas",0) or 0),
-        cpr=float(row.get("cpr",0) or 0),
-        cvr=float(row.get("cvr",0) or 0),
-        ctr=float(row.get("ctr",0) or 0),
-        hook_rate=float(row.get("hook_rate",0) or 0),
-        hold_rate=float(row.get("hold_rate",0) or 0),
-        atc_rate=float(row.get("atc_rate",0) or 0),
-        checkout_rate=float(row.get("checkout_rate",0) or 0),
-        purchase_rate=float(row.get("purchase_rate",0) or 0),
-        probability_to_grow=float(prob),
-        reason=reason
-    )
-
-def account_funnel_report(g: pd.DataFrame) -> FunnelReport:
-    # weighted by clicks/atc/checkout appropriately
-    total_clicks = g["clicks"].sum() if "clicks" in g.columns else 0
-    total_atc = g["atc"].sum() if "atc" in g.columns else 0
-    total_checkout = g["checkout"].sum() if "checkout" in g.columns else 0
-    total_pur = g["purchases"].sum() if "purchases" in g.columns else 0
-
-    ctr = g["ctr"].mean() if "ctr" in g.columns and not g["ctr"].isna().all() else 0.0
-    atc_rate = safe_div(total_atc, total_clicks)
-    checkout_rate = safe_div(total_checkout, total_atc)
-    purchase_rate = safe_div(total_pur, total_checkout)
-    cvr = safe_div(total_pur, total_clicks)
-
-    # Find biggest drop
-    stages = {
-        "Awareness→Click (CTR)": ctr,
-        "Click→ATC": atc_rate,
-        "ATC→Checkout": checkout_rate,
-        "Checkout→Purchase": purchase_rate
-    }
-    # “Bottleneck” = the smallest rate among the post-click stages; CTR poor is creative/audience
-    post_click = {k:v for k,v in stages.items() if "CTR" not in k}
-    bottleneck = min(post_click, key=post_click.get) if post_click else "Click→ATC"
-
-    causes, experiments = [], []
-    # Heuristics for causes/experiments
-    if bottleneck == "Click→ATC":
-        causes = [
-            "Landing page-message mismatch with ad promise",
-            "Slow load / poor mobile UX",
-            "Weak first-screen trust (reviews, badges, social proof)",
-            "Price anchoring or variant confusion"
-        ]
-        experiments = [
-            "Match headline to ad hook; repeat payoff above the fold",
-            "Move social proof (stars, UGC quotes) into first viewport",
-            "Speed test + compress hero; remove render-blocking scripts",
-            "Add price anchor/compare-at; simplify options; default best-seller"
-        ]
-    elif bottleneck == "ATC→Checkout":
-        causes = [
-            "Cart UX friction (popups, surprise fees)",
-            "Shipping/returns unclear, trust not reassured",
-            "Upsell clutter before checkout"
-        ]
-        experiments = [
-            "One-click cart → checkout; delay upsells post-purchase",
-            "Show shipping/returns/promise badges in cart",
-            "Cart reminder micro-copy: delivery time, guarantee"
-        ]
-    elif bottleneck == "Checkout→Purchase":
-        causes = [
-            "Checkout friction (fields, account creation)",
-            "Payment method gaps; address validation issues",
-            "Last-minute price shock (tax, shipping)"
-        ]
-        experiments = [
-            "Enable guest checkout + autofill; reduce required fields",
-            "Add ShopPay/PayPal/Apple Pay; test address autocomplete",
-            "Inline total cost disclosure; free shipping threshold test"
-        ]
-
-    if ctr < 0.012:
-        causes.insert(0, "Creative not compelling or wrong audience")
-        experiments.insert(0, "New hooks/angles; refresh openers; test different audience/geo")
-
-    return FunnelReport(
-        stage_rates={"ctr": round(ctr,4), "atc_rate": round(atc_rate,4), "checkout_rate": round(checkout_rate,4),
-                     "purchase_rate": round(purchase_rate,4), "cvr": round(cvr,4)},
-        biggest_bottleneck=bottleneck,
-        probable_causes=causes[:6],
-        recommended_experiments=experiments[:6]
-    )
-
-def per_ad_issues(g: pd.DataFrame) -> List[PerAdIssue]:
-    issues: List[PerAdIssue] = []
-    for _, r in g.iterrows():
-        ctr = float(r.get("ctr",0) or 0)
-        atc_rate = float(r.get("atc_rate",0) or 0)
-        checkout_rate = float(r.get("checkout_rate",0) or 0)
-        purchase_rate = float(r.get("purchase_rate",0) or 0)
-
-        # simple rules to call out biggest weak link per ad
-        scores = {
-            "Click→ATC": atc_rate,
-            "ATC→Checkout": checkout_rate,
-            "Checkout→Purchase": purchase_rate
-        }
-        stage = min(scores, key=scores.get)
-        hyp = "Landing page mismatch" if stage=="Click→ATC" else ("Checkout friction" if stage=="Checkout→Purchase" else "Cart friction / trust gap")
-
-        exps = {
-            "Click→ATC": [
-                "Rewrite hero to mirror ad hook",
-                "Add review stars & UGC quote above the fold",
-                "Shorten hero copy; tighter bullets"
-            ],
-            "ATC→Checkout": [
-                "Remove pre-checkout upsell; highlight free returns",
-                "Simplify cart; persistent checkout button above the fold"
-            ],
-            "Checkout→Purchase": [
-                "Enable guest checkout; reduce fields",
-                "Add ShopPay/PayPal; reveal total cost early"
-            ],
-        }
-        issues.append(PerAdIssue(
-            ad_id=str(r["ad_name"]), name=str(r["ad_name"]), stage_bottleneck=stage,
-            evidence={
-                "ctr": round(ctr,4), "atc_rate": round(atc_rate,4),
-                "checkout_rate": round(checkout_rate,4), "purchase_rate": round(purchase_rate,4)
-            },
-            hypothesis=hyp,
-            experiments=exps[stage]
-        ))
-    return issues
-
-# ---------------------------
-# Analyze
-# ---------------------------
-@app.post("/analyze", response_model=AnalyzeResponse)
-def analyze(params: AnalyzeParams):
+@app.post("/ingest_csv_debug")
+async def ingest_csv_debug(file: UploadFile = File(...)):
     try:
-        # CPR aliasing
-        if params.target_cpr is None and params.target_cpa is not None:
-            params.target_cpr = params.target_cpa
+        df_raw = read_uploaded_csv(file)
+        df = normalize_columns(df_raw)
+        out = {
+            "columns": list(df_raw.columns),
+            "dtypes": {c: str(df[c].dtype) if c in df else "n/a" for c in df_raw.columns},
+            "sample": json.loads(df.head(5).astype(str).to_json(orient="records"))
+        }
+        return out
+    except Exception as e:
+        set_last_error(e)
+        return JSONResponse(
+            status_code=500,
+            content={"detail": "Parse failed. Hit /debug/last_error for details."}
+        )
 
-        where = []
-        if params.lookback_days:
-            cutoff = (datetime.utcnow().date() - pd.Timedelta(days=params.lookback_days)).isoformat()
-            where.append(f"date >= '{cutoff}'")
-        sql = "SELECT * FROM ad_metrics" + ((" WHERE " + " AND ".join(where)) if where else "")
-        df = pd.read_sql(sql, ENGINE)
+
+@app.get("/debug/last_error")
+def last_error():
+    return {"last_error": LAST_ERROR or "(empty)"}
+
+# ---------------------------
+# Analyze endpoint
+# ---------------------------
+
+@app.post("/analyze")
+def analyze(cfg: AnalyzeConfig):
+    try:
+        df = load_metrics()
         if df.empty:
-            empty_fr = FunnelReport(stage_rates={"ctr":0,"atc_rate":0,"checkout_rate":0,"purchase_rate":0,"cvr"_
+            return {"scale": [], "kill": [], "iterate": [], "potential_winners": [], "diagnostics": [], "creative_gaps": {"needed_new_creatives": 6, "angle_mix": {}, "bans": []}}
+
+        # Group by ad_name over any date range in DB
+        g = df.groupby("ad_name", dropna=False).agg({
+            "spend":"sum","roas":"mean","cpr_eff":"mean","ctr":"mean","clicks":"sum","atc_eff":"sum","checkout_eff":"sum",
+            "purchases_eff":"sum","cpc":"mean","cpm":"mean","reach":"sum","frequency":"mean","hook_rate":"mean","hold_rate":"mean","avg_play_time":"mean"
+        }).reset_index()
+
+        # Derived CVR and GrowthScore
+        g["cvr"] = (g["purchases_eff"] / g["clicks"].replace(0, pd.NA)).fillna(0.0)
+        g["growth_score"] = g.apply(lambda r: growth_score(r, cfg), axis=1)
+
+        # CPR semantics (CPA == CPR on Meta)
+        g["cpr"] = g["cpr_eff"]
+
+        scale, kill, iterate, potential = [], [], [], []
+
+        for _, r in g.iterrows():
+            ad_id = str(r["ad_name"])
+            spend = float(r["spend"])
+            roas  = float(r["roas"] or 0)
+            cpr   = float(r["cpr"]) if pd.notna(r["cpr"]) else None
+            cvr   = float(r["cvr"] or 0)
+            gs    = float(r["growth_score"])
+            ctr   = float(r["ctr"] or 0)
+            hook  = float(r["hook_rate"] or 0)
+            hold  = float(r["hold_rate"] or 0)
+            freq  = float(r["frequency"] or 0)
+
+            diag = funnel_diagnostics(r, cfg)
+            record = {
+                "ad_id": ad_id,
+                "name": ad_id,
+                "spend": round(spend, 2),
+                "roas": round(roas, 2),
+                "cpr": round(cpr, 2) if cpr is not None else None,
+                "cvr": round(cvr, 4),
+                "growth_score": gs,
+                "ctr": round(ctr, 4),
+                "hook_rate": round(hook, 4),
+                "hold_rate": round(hold, 4),
+                "frequency": round(freq, 2),
+                "diagnostics": diag
+            }
+
+            meets_cvr = (not cfg.require_cvr) or (cvr >= cfg.min_cvr)
+            meets_cpr = (cfg.target_cpr is None) or (cpr is not None and cpr <= cfg.target_cpr)
+            meets_roas = roas >= cfg.roas_to_scale
+
+            if spend >= cfg.min_spend_for_scale and meets_cvr and (meets_roas or meets_cpr) and gs >= 0.60:
+                record["reason"] = "Hit scale thresholds (ROAS/CPR/CVR) with strong GrowthScore"
+                record["probability_to_scale"] = round(gs, 3)
+                scale.append(record)
+            elif spend >= cfg.min_spend_for_iterate:
+                # Kill logic: bad economics or fatigue
+                kill_now = False
+                reasons = []
+                if roas == 0 and spend >= cfg.min_spend_for_iterate:
+                    kill_now = True; reasons.append("No purchases at test spend")
+                if cfg.target_cpr is not None and cpr is not None and cpr > cfg.target_cpr * 1.3:
+                    kill_now = True; reasons.append("CPR well above target")
+                if gs < 0.25 and ctr < (cfg.target_ctr or 0.015)*0.6 and hook < (cfg.target_hook or 0.30)*0.6:
+                    kill_now = True; reasons.append("Creative underperforming (hook/CTR)")
+
+                if kill_now:
+                    record["reason"] = "; ".join(reasons) or "Below breakeven or CPR too high"
+                    kill.append(record)
+                else:
+                    record["reason"] = "Between breakeven and target — iterate"
+                    iterate.append(record)
+            else:
+                # Not enough spend → potential winners if GrowthScore promising
+                record["reason"] = "Not enough spend"
+                if gs >= 0.50 or (roas >= 1.5) or (cvr >= (cfg.target_cvr or 0.02)*0.7):
+                    record["probability_to_scale"] = round(gs, 3)
+                    potential.append(record)
+                else:
+                    iterate.append(record)
+
+        # Creative gaps suggestion (very lightweight heuristic)
+        needed_new = max(4, int(len(kill) * 0.5))
+        angle_mix = {
+            "pain": 40,
+            "curiosity": 30,
+            "proof": 20,
+            "social": 10
+        }
+
+        return {
+            "scale": scale,
+            "kill": kill,
+            "iterate": iterate,
+            "potential_winners": potential,
+            "creative_gaps": {"needed_new_creatives": needed_new, "angle_mix": angle_mix, "bans": []}
+        }
+    except Exception as e:
+        set_last_error(e)
+        return JSONResponse(
+            status_code=500,
+            content={"detail": "Analyze failed. Hit /debug/last_error for details."}
+        )
+
+# ---------------------------
+# Coach
+# ---------------------------
+
+COACH_QUESTIONS = [
+    "What is your daily test budget and target CPR (Meta) or CPA?",
+    "What audience(s) and placements are you using (any exclusions or stacking)?",
+    "What’s the exact offer and price the click goes to?",
+    "Do you optimize for Purchase or a proxy (ATC/VC)?",
+    "Any strong past winners to clone (angles, hooks, shots)?",
+    "What’s your top CRO concern on the LP (speed, trust, clarity)?",
+]
+
+@app.get("/coach/questions")
+def coach_questions():
+    return {"questions": COACH_QUESTIONS}
+
+@app.post("/coach/evaluate")
+def coach_evaluate(payload: CoachAnswers):
+    text = payload.answers.lower()
+    objectives = []
+    recs = []
+
+    if "purchase" not in text and "purch" not in text:
+        recs.append("Optimize for Purchase event if volume allows; otherwise use ATC with switch once purchases/day > 10.")
+    if "exclude" not in text and "exclusion" not in text:
+        recs.append("Add exclusions for recent purchasers and heavy engagers to control frequency.")
+    if "ugc" in text or "creative" in text:
+        objectives.append("Ship 6 new creatives this week across 3 angles (pain, curiosity, proof).")
+    else:
+        objectives.append("Brief and ship 4 UGC variants focusing on first 2 seconds (pattern breaks).")
+    if "speed" in text:
+        objectives.append("Raise LP performance to Lighthouse 85+ mobile — compress hero media and inline critical CSS.")
+    objectives.append("Set scale rule: ROAS ≥ 2.0 or CPR ≤ target after $50 spend with CVR ≥ 2%.")
+
+    return {"objectives": objectives, "recommendations": recs}
+
+# ---------------------------
+# Prompt Lab
+# ---------------------------
+
+@app.post("/prompt_lab/generate")
+def prompt_lab_generate(req: PromptLabReq):
+    t = req.target.strip() or "Meta"
+    ctx = req.context.strip()
+
+    template = f"""High-Value {t} Creative/Copy Prompt
+Context:
+{ctx or "[fill in audience, offer, objections, key benefits]"}
+
+Instructions:
+1) Write 5 hooks tailored to the audience pain → benefit in the first 2s.
+2) Produce a 25–35s script: Hook (0–3s) → Problem → Agitate → Solution → Proof → Offer → CTA.
+3) Include 2 pattern breaks and 1 trust signal (testimonial, guarantee, stat).
+4) End with 2 CTAs: primary (purchase) + secondary (learn more).
+5) Provide 3 thumbnail headline options.
+Output format:
+- Hooks (5)
+- Script (timestamped beats)
+- Thumbnails (3)"""
+
+    return {"prompt": template}
+
+# ---------------------------
+# Script Analyzer
+# ---------------------------
+
+def split_sentences(text: str) -> List[str]:
+    # very simple sentence splitter to avoid extra libs
+    parts = []
+    buf = []
+    for ch in text:
+        buf.append(ch)
+        if ch in ".!?":
+            s = "".join(buf).strip()
+            if s:
+                parts.append(s)
+            buf = []
+    tail = "".join(buf).strip()
+    if tail:
+        parts.append(tail)
+    return parts if parts else [text.strip()]
+
+@app.post("/script/analyze")
+def script_analyze(req: ScriptReq):
+    script = (req.script or "").strip()
+    if not script:
+        raise HTTPException(status_code=422, detail="Provide a script to analyze.")
+
+    sents = split_sentences(script)
+
+    # naive segmentation
+    hook = " ".join(sents[:2]).strip()
+    body = sents[2:-1] if len(sents) > 3 else []
+    cta  = sents[-1] if len(sents) >= 1 else ""
+
+    problem = ""
+    solution = ""
+    proof = ""
+    offer = ""
+    # assign heuristics
+    for s in body:
+        low = s.lower()
+        if any(k in low for k in ["struggle", "tired of", "problem", "frustrat", "hard", "can't"]):
+            problem += (" " + s)
+        elif any(k in low for k in ["we", "our", "introduc", "here's how", "works"]):
+            solution += (" " + s)
+        elif any(k in low for k in ["thousand", "5-star", "review", "results", "proof", "before", "after", "guarantee", "warranty"]):
+            proof += (" " + s)
+        elif any(k in low for k in ["save", "% off", "discount", "today", "now", "limited", "free", "bonus"]):
+            offer += (" " + s)
+
+    beats = {
+        "hook": hook.strip(),
+        "problem": problem.strip() or "(not detected)",
+        "solution": solution.strip() or "(not detected)",
+        "proof": proof.strip() or "(not detected)",
+        "offer": offer.strip() or "(not detected)",
+        "cta": cta.strip(),
+    }
+
+    # rough timing (if requested)
+    timing = None
+    if req.target_seconds:
+        # weight beats by length
+        lengths = {k: len(v) for k, v in beats.items()}
+        total = sum(max(1, v) for v in lengths.values())
+        timing = {k: round(req.target_seconds * (max(1, lengths[k]) / total)) for k in beats}
+
+    tips = []
+    if len(hook.split()) < 8:
+        tips.append("Make the hook a concrete payoff promise in ≤ 8 words (and show it visually).")
+    if "(not detected)" in beats["problem"]:
+        tips.append("State a clear ‘problem’ in the audience’s own words before pitching.")
+    if "(not detected)" in beats["proof"]:
+        tips.append("Insert 1 strong proof element (testimonial, stat, before/after).")
+    if "click" not in beats["cta"].lower() and "buy" not in beats["cta"].lower():
+        tips.append("End with a direct CTA (‘Tap Shop Now’ / ‘Get yours today’).")
+
+    return {"beats": beats, "timing": timing, "suggestions": tips, "platform": req.platform}
+
+# ---------------------------
+# Small health check
+# ---------------------------
+
+@app.get("/healthz")
+def healthz():
+    return {"ok": True, "version": APP_VERSION}
+
