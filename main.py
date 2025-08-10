@@ -1,652 +1,687 @@
 # main.py
-# FastAPI Media-Buyer Assistant — Coach / Prompt Lab / Script Doctor
-# Drop-in single file. Requires: fastapi, uvicorn, pydantic, pandas, numpy, httpx, python-multipart
+# ERTO Agent — lightweight, DB-free version
+# FastAPI app with: CSV ingest, Coach, Prompt Lab, Script Doctor, and a clean dark UI.
 
-from fastapi import FastAPI, UploadFile, File, Body
-from fastapi.responses import JSONResponse, HTMLResponse
-from pydantic import BaseModel
+from fastapi import FastAPI, UploadFile, File
+from fastapi.responses import HTMLResponse, JSONResponse
+from fastapi.middleware.cors import CORSMiddleware
 import pandas as pd
 import numpy as np
-import io, os, traceback, json
-import httpx
-from statistics import pstdev
-from datetime import datetime, timedelta
+import io
+import traceback
+import datetime as dt
 
-app = FastAPI(title="Erto Agent", version="2.1.0")
+app = FastAPI(title="ERTO Agent", version="1.0.0")
 
-# ---------------------------
-# In-memory store
-# ---------------------------
-MEMORY = {
-    "df": None,
-    "last_error": None,
-}
+app.add_middleware(
+    CORSMiddleware,
+    allow_origins=["*"],
+    allow_methods=["*"],
+    allow_headers=["*"],
+)
 
-# ---------------------------
-# Settings (editable)
-# ---------------------------
+# --------------------------------------------------------------------------------------
+# In-memory store (keeps it simple & avoids DB 500s). You can swap to a DB later.
+# --------------------------------------------------------------------------------------
+LAST_DF: pd.DataFrame | None = None
+LAST_ERROR: str | None = None
+
+# Defaults / thresholds
 SETTINGS = {
-    # Financial guardrails
-    "breakeven_roas": 1.54,        # used if we can't derive breakeven CPA
+    "breakeven_roas": 1.54,
     "target_roas": 2.0,
-    "min_test_spend": 20.0,        # spend threshold to judge a creative
-    "min_scale_spend": 50.0,       # spend threshold to consider scaling
-    "avg_margin": 0.30,            # used to derive breakeven CPA from AOV when target_cpa is None
-    "target_cpa": None,            # optional override (Meta CPR ~ CPA)
-
-    # Creative soft metrics
-    "hook_good": 0.30,             # 30%
-    "hold_good": 0.10,             # 10%
-    "ctr_good": 0.015,             # 1.5%
-
-    # Trend & fatigue
-    "trend_window": 3,             # days
-    "fatigue_freq": 3.0,           # avg frequency threshold
-    "fatigue_ctr_drop": 0.25,      # ≥25% CTR drop vs prior period
-
-    # External data
-    "external_data": False,        # set True to allow Serper snippets
+    "min_test_spend": 20.0,
+    "min_scale_spend": 50.0,
+    "hook_good": 0.30,   # 30%
+    "hold_good": 0.10,   # 10%
+    "ctr_good": 0.015,   # 1.5%
+    "assume_click_attrib_ok": False,   # set True if you know 7d-click >= 60%
+    "external_data": False,            # placeholder for future external intelligence
 }
 
-# ============================================================
-# Helpers
-# ============================================================
+# --------------------------------------------------------------------------------------
+# Utilities
+# --------------------------------------------------------------------------------------
+def set_last_error(e: Exception):
+    global LAST_ERROR
+    LAST_ERROR = "".join(traceback.format_exception(type(e), e, e.__traceback__))
 
-def _set_error(e: Exception):
-    MEMORY["last_error"] = "".join(traceback.format_exception(type(e), e, e.__traceback__))
-
-def _read_csv(upload: UploadFile) -> pd.DataFrame:
-    raw = upload.file.read()
-    data = io.BytesIO(raw)
-    try:
-        df = pd.read_csv(data)
-    except Exception:
-        data.seek(0)
-        df = pd.read_csv(data, encoding="utf-8", engine="python")
-    return df
-
-def _num(x):
-    """Robust numeric coercion for messy CSVs."""
-    if pd.isna(x):
-        return np.nan
-    if isinstance(x, (int, float, np.number)):
-        return float(x)
-    x = str(x).replace(",", "").strip()
-    if x == "" or x.lower() in {"nan", "none", "null", "-"}:
+def _to_float(x):
+    if x is None or (isinstance(x, float) and np.isnan(x)):
         return np.nan
     try:
-        return float(x)
+        s = str(x).strip().replace(",", "")
+        if s.endswith("%"):
+            return float(s[:-1]) / 100.0
+        val = float(s)
+        return val
     except Exception:
         return np.nan
 
-def _as_frac_from_percent(val):
-    """Convert a percent-like value (e.g., 2.5 means 2.5%) into fraction."""
-    v = _num(val)
+def _pct_to_decimal(x):
+    """If a 'percentage-looking' number is >1, assume it was given as 3.5 meaning 3.5%."""
+    v = _to_float(x)
     if pd.isna(v):
         return np.nan
-    # If value >1 it's likely a percentage (e.g., 3.5 => 0.035)
-    return v/100.0 if v > 1 else v
+    return v / 100.0 if v > 1.0 else v
 
-def _standardize_columns(df: pd.DataFrame) -> pd.DataFrame:
-    """Map Meta export columns → normalized schema used by analyzer."""
-    d = df.copy()
+def _first_existing(df: pd.DataFrame, candidates: list[str]):
+    for c in candidates:
+        if c in df.columns:
+            return c
+    return None
 
-    # Flexible column lookup
-    def pick(*names, default=None):
-        for n in names:
-            if n in d.columns:
-                return n
-        return default
+def _normalize_columns(df: pd.DataFrame) -> pd.DataFrame:
+    """Map many Meta export variants into a normalized schema."""
+    df = df.copy()
 
-    # Column candidates
-    col_ad        = pick("Ad name", "Ad", "Ad Name", "ad", default=None)
-    col_date      = pick("Day", "Date", "date", "Reporting starts", default=None)
-    col_spend     = pick("Amount spent (USD)", "Spend", "spend", default=None)
-    col_roas      = pick("Purchase ROAS (return on ad spend)", "Website purchase ROAS (return on advertising spend)", "ROAS", "roas", default=None)
-    col_rev       = pick("Purchase conversion value", "Website purchase conversion value", "revenue", "Revenue", default=None)
-    col_purch     = pick("Website purchases", "Purchases", "purchases", default=None)
-    col_clicks    = pick("Link clicks", "Unique link clicks", "Clicks", "clicks", default=None)
-    col_ctr       = pick("CTR (link click-through rate)", "Unique link click-through rate", "CTR", "ctr", default=None)
-    col_hook      = pick("hook rate", "Video 3-second plays / Impressions", "hook", default=None)
-    col_hold      = pick("hold rate", "Video throughplays / Impressions", "hold", default=None)
-    col_cpr       = pick("Cost per purchase", "Cost per result", "CPR", "cpr", default=None)
-    col_cvr       = pick("conversion rate", "Conversion Rate", "CVR", "cvr", default=None)
-    col_atc       = pick("Website adds to cart", "Adds to cart", "add to cart", "atc", default=None)
-    col_ic        = pick("Website checkouts initiated", "Checkouts initiated", "ic", default=None)
-    col_freq      = pick("Frequency", "freq", default=None)
-    col_impr      = pick("Impressions", "impressions", default=None)
-    col_reach     = pick("Reach", "reach", default=None)
-    col_cpm       = pick("CPM (cost per 1,000 impressions)", "CPM", "cpm", default=None)
+    # Standard name mapping guesses
+    col_ad        = _first_existing(df, ["Ad name", "Ad", "Ad Name"])
+    col_adset     = _first_existing(df, ["Ad set name", "Ad set name.1", "Ad Set", "Ad Set Name"])
+    col_campaign  = _first_existing(df, ["Campaign name", "Campaign", "Campaign Name"])
+    col_day       = _first_existing(df, ["Day", "date", "Date", "Reporting starts"])
+    col_spend     = _first_existing(df, ["Amount spent (USD)", "Spend", "Amount Spent"])
+    col_roas_w    = _first_existing(df, ["Website purchase ROAS (return on advertising spend)"])
+    col_roas      = _first_existing(df, ["Purchase ROAS (return on ad spend)", "ROAS"])
+    col_revenue   = _first_existing(df, ["Purchase conversion value", "Website purchase conversion value", "Revenue", "Sales"])
+    col_clicks    = _first_existing(df, ["Link clicks", "Unique link clicks", "Outbound clicks", "Unique outbound clicks"])
+    col_ctr       = _first_existing(df, ["CTR (link click-through rate)", "Unique link click-through rate", "Unique outbound CTR"])
+    col_hook      = _first_existing(df, ["hook rate", "Hook rate", "Video hook", "3-second video plays / impressions"])
+    col_hold      = _first_existing(df, ["hold rate", "Hold rate", "Video hold", "ThruPlays / impressions"])
+    col_atc       = _first_existing(df, ["Adds to cart", "Website adds to cart", "Add to cart"])
+    col_ci        = _first_existing(df, ["Checkouts initiated", "Website checkouts initiated", "Initiate checkout"])
+    col_purch     = _first_existing(df, ["Website purchases", "Purchases", "purchases"])
+    col_cpr       = _first_existing(df, ["Cost per purchase", "Cost per result"])
+    col_imps      = _first_existing(df, ["Impressions"])
+    col_freq      = _first_existing(df, ["Frequency"])
 
     out = pd.DataFrame()
-    out["ad"] = d[col_ad] if col_ad else "unknown"
+    out["ad"]       = df[col_ad] if col_ad else "Unknown"
+    out["adset"]    = df[col_adset] if col_adset else ""
+    out["campaign"] = df[col_campaign] if col_campaign else ""
     # dates
-    if col_date:
-        out["dte"] = pd.to_datetime(d[col_date], errors="coerce")
-    elif "Reporting starts" in d.columns:
-        out["dte"] = pd.to_datetime(d["Reporting starts"], errors="coerce")
+    if col_day:
+        try:
+            out["dte"] = pd.to_datetime(df[col_day]).dt.date.astype(str)
+        except Exception:
+            out["dte"] = df[col_day].astype(str)
     else:
-        out["dte"] = pd.NaT
+        out["dte"] = dt.date.today().isoformat()
 
-    # spend/revenue/purchases
-    out["spend"] = d[col_spend].map(_num) if col_spend else np.nan
-    if col_rev:
-        out["revenue"] = d[col_rev].map(_num)
+    # numbers
+    out["spend"]    = df[col_spend].map(_to_float) if col_spend else np.nan
+    # ROAS priority: website roas > roas > revenue/spend
+    roas_series = None
+    if col_roas_w:
+        roas_series = df[col_roas_w].map(_to_float)
+    elif col_roas:
+        roas_series = df[col_roas].map(_to_float)
     else:
-        # derive from ROAS if present
-        if col_roas and col_spend:
-            out["revenue"] = d[col_roas].map(_num) * d[col_spend].map(_num)
-        else:
-            out["revenue"] = np.nan
-    out["purchases"] = d[col_purch].map(_num) if col_purch else np.nan
+        roas_series = pd.Series(np.nan, index=df.index)
 
-    # clicks / ctr
-    out["clicks"] = d[col_clicks].map(_num) if col_clicks else np.nan
-    if col_ctr:
-        out["ctr"] = d[col_ctr].map(_as_frac_from_percent)
+    revenue = df[col_revenue].map(_to_float) if col_revenue else np.nan
+    if isinstance(revenue, pd.Series):
+        out["revenue"] = revenue
     else:
-        # derive if possible later via clicks/impr
-        out["ctr"] = np.nan
+        out["revenue"] = np.nan
 
-    # hook / hold — Meta export already fractional in many accounts
-    out["hook"] = d[col_hook].map(_num) if col_hook else np.nan
-    out["hold"] = d[col_hold].map(_num) if col_hold else np.nan
+    out["clicks"]   = df[col_clicks].map(_to_float) if col_clicks else np.nan
+    out["ctr"]      = df[col_ctr].map(_pct_to_decimal) if col_ctr else np.nan
+    out["hook"]     = df[col_hook].map(_to_float) if col_hook else np.nan
+    out["hold"]     = df[col_hold].map(_to_float) if col_hold else np.nan
+    out["atc"]      = df[col_atc].map(_to_float) if col_atc else np.nan
+    out["ic"]       = df[col_ci].map(_to_float) if col_ci else np.nan
+    out["purchases"]= df[col_purch].map(_to_float) if col_purch else np.nan
+    out["cpr"]      = df[col_cpr].map(_to_float) if col_cpr else np.nan
+    out["imps"]     = df[col_imps].map(_to_float) if col_imps else np.nan
+    out["freq"]     = df[col_freq].map(_to_float) if col_freq else np.nan
 
-    # CPR, CVR
-    out["cpr"] = d[col_cpr].map(_num) if col_cpr else np.nan
-    if col_cvr:
-        # can be % or fraction depending on custom metric; normalize
-        out["cvr"] = d[col_cvr].map(_as_frac_from_percent)
-    else:
-        # fallback: purchases / clicks
-        out["cvr"] = np.where((out["purchases"] > 0) & (out["clicks"] > 0), out["purchases"] / out["clicks"], np.nan)
+    # compute roas if missing & revenue present
+    out["roas"] = roas_series
+    need_roas = out["roas"].isna() & out["spend"].gt(0) & out["revenue"].notna()
+    out.loc[need_roas, "roas"] = out.loc[need_roas, "revenue"] / out.loc[need_roas, "spend"]
 
-    # Funnel
-    out["atc"] = d[col_atc].map(_num) if col_atc else np.nan
-    out["ic"]  = d[col_ic].map(_num)  if col_ic  else np.nan
+    # compute revenue from spend*roas if revenue missing
+    need_rev = out["revenue"].isna() & out["spend"].notna() & out["roas"].notna()
+    out.loc[need_rev, "revenue"] = out.loc[need_rev, "spend"] * out.loc[need_rev, "roas"]
 
-    # Reach / Impr / Freq / CPM
-    out["freq"] = d[col_freq].map(_num) if col_freq else np.nan
-    out["impr"] = d[col_impr].map(_num) if col_impr else np.nan
-    out["reach"] = d[col_reach].map(_num) if col_reach else np.nan
-    out["cpm"] = d[col_cpm].map(_num) if col_cpm else np.nan
+    # CVR as purchases/clicks
+    with np.errstate(divide="ignore", invalid="ignore"):
+        out["cvr"] = out["purchases"] / out["clicks"]
 
-    # derive missing CTR, Impressions
-    out["impr"] = np.where(out["impr"].isna() & out["reach"].notna() & out["freq"].notna(), out["reach"] * out["freq"], out["impr"])
-    out["ctr"]  = np.where(out["ctr"].isna() & out["clicks"].notna() & out["impr"].notna() & (out["impr"]>0), out["clicks"] / out["impr"], out["ctr"])
+    # clean weird percentages in hook/hold (if someone exported as 35 -> 35%)
+    for col in ["hook", "hold"]:
+        out[col] = out[col].apply(lambda v: np.nan if pd.isna(v) else (v/100.0 if v > 1.0 else v))
 
-    # Clean types
-    out["ad"] = out["ad"].astype(str)
+    # clamp insane values to avoid skewing UI
+    out["roas"] = out["roas"].clip(lower=0, upper=50)
+    out["ctr"]  = out["ctr"].clip(lower=0, upper=0.5)
+    out["hook"] = out["hook"].clip(lower=0, upper=1)
+    out["hold"] = out["hold"].clip(lower=0, upper=1)
+
     return out
 
-def _derive_cpa_targets(df: pd.DataFrame):
-    """Return (breakeven_cpa, target_cpa). If target_cpa is set, use it; else derive from AOV * margin."""
-    if SETTINGS.get("target_cpa"):
-        return SETTINGS["target_cpa"], SETTINGS["target_cpa"]
-    purchases = float(df["purchases"].sum(skipna=True) or 0)
-    revenue   = float(df["revenue"].sum(skipna=True) or 0)
-    aov = (revenue / purchases) if purchases > 0 else 0
-    breakeven = aov * SETTINGS.get("avg_margin", 0.30) if aov > 0 else None
-    return breakeven, breakeven
-
-def _last_n_vs_prev(df: pd.DataFrame, n: int):
-    if "dte" not in df.columns or df.empty:
-        return df, pd.DataFrame()
-    d = df.dropna(subset=["dte"]).sort_values("dte")
-    if d.empty:
-        return d, pd.DataFrame()
-    last_day = d["dte"].max()
-    last_n = d[d["dte"] > last_day - pd.Timedelta(days=n)]
-    prev_n = d[(d["dte"] <= last_day - pd.Timedelta(days=1)) & (d["dte"] > last_day - pd.Timedelta(days=2*n))]
-    return last_n, prev_n
-
-def _period_agg(d):
-    if d.empty:
-        return {"roas":0,"cpr":0,"ctr":0,"spend":0}
-    spend = float(d["spend"].sum(skipna=True) or 0)
-    rev   = float(d["revenue"].sum(skipna=True) or 0)
-    roas  = rev/spend if spend>0 else 0
-    cpr   = (spend / float(d["purchases"].sum(skipna=True))) if float(d["purchases"].sum(skipna=True))>0 else 0
-    ctr   = float(d["ctr"].mean(skipna=True) or 0)
-    return {"roas":roas,"cpr":cpr,"ctr":ctr,"spend":spend}
-
-def _roas_volatility(d):
-    vals = d.dropna(subset=["roas"]).sort_values("dte")["roas"].tail(7).tolist() if "roas" in d else []
-    return pstdev(vals) if len(vals) >= 2 else 0.0
-
-async def _serper_snippets(query: str):
-    if not SETTINGS.get("external_data"):
-        return []
-    key = os.getenv("SERPER_API_KEY")
-    if not key:
-        return []
+def _fmt_pct(x):
     try:
-        async with httpx.AsyncClient(timeout=12) as client:
-            r = await client.post("https://google.serper.dev/search",
-                headers={"X-API-KEY": key, "Content-Type":"application/json"},
-                json={"q": query, "num": 5})
-            j = r.json()
-        snippets = []
-        for item in (j.get("organic",[]) or [])[:5]:
-            s = item.get("snippet") or ""
-            if s: snippets.append(s.strip())
-        return snippets
+        return f"{float(x)*100:.1f}%"
     except Exception:
-        return []
+        return "-"
+
+GOOD = {"hook": SETTINGS["hook_good"], "hold": SETTINGS["hold_good"], "ctr": SETTINGS["ctr_good"]}
+
+def _growth_score(row):
+    roas   = float(row.get("roas", 0) or 0)
+    cpr    = float(row.get("cpr", 0) or 0)
+    ctr    = float(row.get("ctr", 0) or 0)
+    hook   = float(row.get("hook", 0) or 0)
+    hold   = float(row.get("hold", 0) or 0)
+    spend  = float(row.get("spend", 0) or 0)
+
+    early  = (min(ctr / GOOD["ctr"] if GOOD["ctr"]>0 else 0, 2.0) +
+              min(hook / GOOD["hook"] if GOOD["hook"]>0 else 0, 2.0) +
+              min(hold / GOOD["hold"] if GOOD["hold"]>0 else 0, 2.0)) / 3
+    roi    = min(roas / SETTINGS["target_roas"] if SETTINGS["target_roas"]>0 else roas, 2.0)
+    spendw = min(spend / SETTINGS["min_scale_spend"], 1.0) if SETTINGS["min_scale_spend"]>0 else 0
+    pain   = 0 if cpr == 0 else min(1.5 / cpr, 1.0)
+
+    return round(0.45 * roi + 0.35 * early + 0.10 * spendw + 0.10 * pain, 3)
+
+def _ad_card(row):
+    tips = []
+    if float(row.get("hook",0) or 0) < GOOD["hook"]: tips.append("Strengthen 0–3s hook (pattern break).")
+    if float(row.get("hold",0) or 0) < GOOD["hold"]: tips.append("Add proof or story beat @7–12s.")
+    if float(row.get("ctr",0)  or 0) < GOOD["ctr"]:  tips.append("Tighter first line + clearer CTA.")
+    if float(row.get("roas",0) or 0) < SETTINGS["breakeven_roas"]:
+        tips.append("Below breakeven—iterate or pause.")
+    if not tips: tips = ["On track—watch for 72h stability before scaling."]
+
+    metrics = [
+        {"k":"Spend", "v": f"${float(row.get('spend',0) or 0):.2f}"},
+        {"k":"ROAS",  "v": f"{float(row.get('roas',0) or 0):.2f}"},
+        {"k":"CPR",   "v": f"${float(row.get('cpr',0) or 0):.2f}"},
+        {"k":"CVR",   "v": _fmt_pct(row.get('cvr',0))},
+        {"k":"CTR",   "v": _fmt_pct(row.get('ctr',0))},
+        {"k":"Hook",  "v": _fmt_pct(row.get('hook',0))},
+        {"k":"Hold",  "v": _fmt_pct(row.get('hold',0))},
+    ]
+    return {
+        "title": row.get("name") or row.get("ad") or "Ad",
+        "score": _growth_score(row),
+        "metrics": metrics,
+        "tips": tips,
+        "raw": row,
+    }
 
 def _coach_narrative(summary, funnel, top_cards):
-    parts = []
-    parts.append(f"Spend ${summary['spend']:.2f} on {summary['purchases']} purchases → avg ROAS **{summary['avg_roas']:.2f}** (target {SETTINGS['target_roas']}).")
+    s = summary
     f = funnel.get("blended", {})
+    lines = []
+    lines.append(
+        f"Spend ${s['spend']:.2f} on {int(s.get('purchases',0) or 0)} purchases "
+        f"→ avg ROAS **{s.get('avg_roas',0):.2f}** (target {s['settings']['target_roas']})."
+    )
     if f:
-        parts.append(f"Funnel — Click→ATC: **{f.get('click_to_atc',0):.1%}**, ATC→IC: **{f.get('atc_to_ic',0):.1%}**, IC→Purchase: **{f.get('ic_to_purchase',0):.1%}**.")
-    dx = funnel.get("diagnosis", [])
-    if dx:
-        parts.append("Diagnosis: " + "; ".join(dx))
+        lines.append(
+            f"Funnel — Click→ATC: **{_fmt_pct(f.get('click_to_atc',0))}**, "
+            f"ATC→IC: **{_fmt_pct(f.get('atc_to_ic',0))}**, "
+            f"IC→Purchase: **{_fmt_pct(f.get('ic_to_purchase',0))}**."
+        )
+    if funnel.get("diagnosis"):
+        lines.append("Diagnosis: " + "; ".join(funnel["diagnosis"]))
     if top_cards:
-        watch = ", ".join([c["name"] for c in top_cards[:3]])
-        parts.append(f"Watching potential winners: {watch}")
-    parts.append("Next 24–72h: ensure ≥60% 7-day click before any +20% scale; fix the biggest funnel leak; add 1 new creative variant.")
-    return " ".join(parts)
+        winners = [c["title"] for c in top_cards[:3]]
+        lines.append("Watching potential winners: " + ", ".join(winners))
+    lines.append(
+        "Next 24–72h: ensure ≥60% 7-day click before scaling +20%; "
+        "shore up the biggest funnel leak with a page change + one creative variant."
+    )
+    return "\n".join(lines)
 
-def _ad_tips(row, breakeven_cpa):
-    tips = []
-    # Soft metrics guidance
-    if not pd.isna(row.get("hook")) and row["hook"] < SETTINGS["hook_good"]:
-        tips.append("Hook is soft — test a harder pattern break in first 2s (motion + contrast + direct benefit).")
-    if not pd.isna(row.get("hold")) and row["hold"] < SETTINGS["hold_good"]:
-        tips.append("Hold is weak — tighten middle: demo faster, add captions & quick proof within 8–12s.")
-    if not pd.isna(row.get("ctr")) and row["ctr"] < SETTINGS["ctr_good"]:
-        tips.append("CTR low — thumbnail/first-frame and opening line need stronger curiosity or outcome.")
-    # Down-funnel diagnosis
-    if row.get("cvr") and row["cvr"] < 0.01 and (row.get("ctr") or 0) >= SETTINGS["ctr_good"]:
-        tips.append("Clicks not converting — suspect PDP clarity/price anchor; add social proof bar + FAQs near CTA.")
-    # CPR / ROAS gates
-    if breakeven_cpa and row.get("cpa") and row["cpa"] > breakeven_cpa * 1.1:
-        tips.append(f"CPA ${row['cpa']:.2f} above breakeven — pause or re-cut creative; try stronger offer framing.")
-    if row.get("roas",0) >= SETTINGS["target_roas"] and row.get("spend",0) >= SETTINGS["min_scale_spend"]:
-        tips.append("On track — verify ≥60% 7-day click attribution and scale +20%.")
-    if not tips:
-        tips.append("Between breakeven and target — let it gather more spend or iterate a variant.")
-    return tips
+# --------------------------------------------------------------------------------------
+# Endpoints
+# --------------------------------------------------------------------------------------
+@app.get("/healthz")
+def health():
+    return {"ok": True, "has_data": LAST_DF is not None}
+
+@app.get("/debug/last_error")
+def last_error():
+    return {"last_error": LAST_ERROR or ""}
+
+@app.post("/ingest_csv_debug")
+async def ingest_csv_debug(file: UploadFile = File(...)):
+    """Parse-only: show columns/dtypes/sample. No write."""
+    try:
+        content = await file.read()
+        df = pd.read_csv(io.BytesIO(content))
+        dtypes = {c: str(df[c].dtype) for c in df.columns}
+        sample = df.head(5).fillna("").astype(str).to_dict(orient="records")
+        return {"columns": list(df.columns), "dtypes": dtypes, "sample": sample}
+    except Exception as e:
+        set_last_error(e)
+        return JSONResponse({"detail": "Failed to parse CSV."}, status_code=500)
+
+@app.post("/ingest_csv")
+async def ingest_csv(file: UploadFile = File(...)):
+    """Upload any Meta CSV (any date range). Rows are normalized and kept in memory."""
+    global LAST_DF
+    try:
+        content = await file.read()
+        raw = pd.read_csv(io.BytesIO(content))
+        norm = _normalize_columns(raw)
+
+        # append if we already have data
+        if LAST_DF is not None:
+            LAST_DF = pd.concat([LAST_DF, norm], ignore_index=True)
+        else:
+            LAST_DF = norm
+
+        return {
+            "rows_added": int(norm.shape[0]),
+            "columns": list(norm.columns),
+            "note": "Stored in memory. Restart clears it.",
+        }
+    except Exception as e:
+        set_last_error(e)
+        return JSONResponse({"detail": "Server failed to ingest CSV. Hit /debug/last_error for details."}, status_code=500)
 
 def _analyze(df: pd.DataFrame) -> dict:
+    """Core analysis used by /coach."""
     if df is None or df.empty:
         return {
             "summary": {"spend": 0, "purchases": 0, "clicks": 0, "avg_roas": 0, "settings": SETTINGS},
             "funnel": {"blended": {}, "diagnosis": ["No data ingested."]},
             "decisions": {"scale": [], "iterate": [], "kill": []},
-            "rising": [], "fatigue": [], "playbook": []
         }
 
-    # Account-level summary
+    g = df.groupby("ad", dropna=False)
+
+    # aggregate per ad
+    agg = g.agg({
+        "spend": "sum",
+        "revenue": "sum",
+        "purchases": "sum",
+        "clicks": "sum",
+        "ctr": "mean",
+        "hook": "mean",
+        "hold": "mean",
+        "cpr": "mean",
+        "cvr": "mean",
+    }).reset_index()
+
+    # fallback roas if needed
+    agg["roas"] = np.where(agg["spend"]>0, (agg["revenue"].fillna(0))/agg["spend"], np.nan)
+    agg["name"] = agg["ad"]
+
+    # account summary
     spend = float(df["spend"].sum(skipna=True))
     purchases = float(df["purchases"].sum(skipna=True))
     clicks = float(df["clicks"].sum(skipna=True))
-    revenue = float(df["revenue"].sum(skipna=True))
-    avg_roas = (revenue/spend) if spend>0 else 0.0
-    breakeven_cpa, target_cpa = _derive_cpa_targets(df)
+    total_rev = float(df["revenue"].sum(skipna=True))
+    avg_roas = (total_rev / spend) if spend > 0 else 0.0
 
     summary = {
-        "spend": round(spend,2),
+        "spend": round(spend, 2),
         "purchases": int(purchases),
         "clicks": int(clicks),
-        "avg_roas": round(avg_roas,2),
-        "settings": {**SETTINGS, "breakeven_cpa": breakeven_cpa, "target_cpa": target_cpa}
+        "avg_roas": round(avg_roas, 2),
+        "settings": SETTINGS,
     }
 
-    # Per-ad aggregates
-    g = df.groupby("ad", dropna=False)
-    agg = g.agg({
-        "spend":"sum","revenue":"sum","purchases":"sum","clicks":"sum",
-        "ctr":"mean","hook":"mean","hold":"mean","cpr":"mean","cvr":"mean","freq":"mean"
-    }).reset_index().rename(columns={"ad":"name"})
-    agg["roas"] = np.where(agg["spend"]>0, (agg["revenue"].fillna(0))/agg["spend"], 0)
-    agg["cpa"]  = np.where(agg["purchases"]>0, agg["spend"]/agg["purchases"], 0)
-
-    # Funnel diagnosis
+    # simple funnel
     atc = float(df["atc"].sum(skipna=True)) if "atc" in df else np.nan
-    ic  = float(df["ic"].sum(skipna=True))  if "ic" in df  else np.nan
-    def r(n,d): return (n/d) if (d and d>0) else 0.0
+    ic  = float(df["ic"].sum(skipna=True)) if "ic" in df else np.nan
+    def _rate(n, d): 
+        if d and d>0: 
+            return n / d
+        return 0.0
     funnel_blended = {
-        "clicks": clicks, "add_to_cart": atc, "initiate_checkout": ic, "purchases": purchases,
-        "click_to_atc": r(atc, clicks), "atc_to_ic": r(ic, atc), "ic_to_purchase": r(purchases, ic)
+        "clicks": clicks,
+        "add_to_cart": atc,
+        "initiate_checkout": ic,
+        "purchases": purchases,
+        "click_to_atc": _rate(atc, clicks),
+        "atc_to_ic": _rate(ic, atc),
+        "ic_to_purchase": _rate(purchases, ic),
     }
+
     diagnosis = []
-    if funnel_blended["click_to_atc"] < 0.20 and clicks>=200:
-        diagnosis.append("Low Click→ATC: clarify promise & price anchor on PDP; make the ‘why now’ obvious above the fold.")
-    if funnel_blended["atc_to_ic"] < 0.40 and atc>=80:
-        diagnosis.append("Low ATC→IC: cart UX friction or fee surprise; make ‘Continue to checkout’ primary, surface shipping earlier.")
-    if funnel_blended["ic_to_purchase"] < 0.40 and ic>=40:
-        diagnosis.append("Low Checkout→Purchase: payment trust issues; add badges by button, returns copy, express options (ShopPay/PayPal).")
+    if funnel_blended["ic_to_purchase"] < 0.4 and purchases >= 5:
+        diagnosis.append("Low Checkout→Purchase (checkout friction, payment issues, missing reassurance).")
+    if funnel_blended["click_to_atc"] < 0.2 and clicks >= 200:
+        diagnosis.append("Low Click→ATC (offer clarity, price anchoring, trust signals).")
     if not diagnosis:
-        diagnosis.append("No single catastrophic leak; focus on creative/offer depth and stable scaling rhythm (72h).")
+        diagnosis.append("No major funnel leak detected; focus on creative testing + offer depth.")
 
-    # Rising winners & fatigue (window vs previous window)
-    rising, fatigue = [], []
-    n = SETTINGS["trend_window"]
-    for ad, d_ad in df.groupby("ad"):
-        d_ad = d_ad.copy()
-        d_ad["roas"] = np.where(d_ad["spend"]>0, d_ad["revenue"]/d_ad["spend"], np.nan)
-        last_n, prev_n = _last_n_vs_prev(d_ad, n)
-        cur = _period_agg(last_n); prev = _period_agg(prev_n)
-        if cur["spend"]>=SETTINGS["min_test_spend"] and cur["roas"]>max(prev["roas"], SETTINGS["breakeven_roas"])*1.15:
-            rising.append({"name": ad, "roas_now": round(cur["roas"],2), "roas_prev": round(prev["roas"],2), "spend_now": round(cur["spend"],2)})
-        freq = float(d_ad["freq"].mean(skipna=True) or 0)
-        ctr_now, ctr_prev = cur["ctr"], prev["ctr"]
-        if freq >= SETTINGS["fatigue_freq"] and ctr_prev>0 and (ctr_prev-ctr_now)/ctr_prev >= SETTINGS["fatigue_ctr_drop"]:
-            fatigue.append({"name": ad, "freq": round(freq,2), "ctr_now": round(ctr_now,4), "ctr_prev": round(ctr_prev,4)})
-
-    # Build decisions with richer reasons
+    # decisions
     SCALE, ITERATE, KILL = [], [], []
-    for _, r in agg.sort_values("spend", ascending=False).iterrows():
+    for _, r in agg.iterrows():
         row = {
-            "ad_id": r["name"], "name": r["name"],
-            "spend": round(float(r["spend"] or 0),2),
-            "roas": round(float(r["roas"] or 0),3),
-            "cpa": round(float(r["cpa"] or 0),2),
-            "cpr": round(float(r["cpr"] or 0),3) if not pd.isna(r["cpr"]) else 0,
-            "cvr": round(float(r["cvr"] or 0),4) if not pd.isna(r["cvr"]) else 0,
-            "ctr": round(float(r["ctr"] or 0),4) if not pd.isna(r["ctr"]) else 0,
-            "hook": round(float(r["hook"] or 0),4) if not pd.isna(r["hook"]) else 0,
-            "hold": round(float(r["hold"] or 0),4) if not pd.isna(r["hold"]) else 0,
-            "freq": round(float(r["freq"] or 0),2) if not pd.isna(r["freq"]) else 0,
+            "ad_id": r["ad"],
+            "name": r["name"],
+            "spend": round(float(r["spend"] or 0), 2),
+            "roas": round(float(r["roas"] or 0), 3),
+            "cpr": round(float(r["cpr"] or 0), 3) if not pd.isna(r["cpr"]) else 0,
+            "cvr": round(float(r["cvr"] or 0), 4) if not pd.isna(r["cvr"]) else 0,
+            "ctr": round(float(r["ctr"] or 0), 4) if not pd.isna(r["ctr"]) else 0,
+            "hook": round(float(r["hook"] or 0), 4) if not pd.isna(r["hook"]) else 0,
+            "hold": round(float(r["hold"] or 0), 4) if not pd.isna(r["hold"]) else 0,
         }
-        # volatility by ad
-        d_ad = df[df["ad"]==r["name"]].copy()
-        d_ad["roas"] = np.where(d_ad["spend"]>0, d_ad["revenue"]/d_ad["spend"], np.nan)
-        vol = _roas_volatility(d_ad)
-        tips = _ad_tips(row, breakeven_cpa)
-
-        # scale?
-        if row["spend"]>=SETTINGS["min_scale_spend"] and row["roas"]>=SETTINGS["target_roas"]:
-            reason = (f"Meets scaling gate: ROAS {row['roas']:.2f} ≥ target {SETTINGS['target_roas']} with spend ${row['spend']:.0f}. "
-                      f"Volatility last 7d: {vol:.2f}. Action: +20% if ≥60% 7-day click attribution; recheck in 24–48h.")
-            SCALE.append({**row, "reason": reason, "tips": tips})
-        # kill?
-        elif row["spend"]>=SETTINGS["min_test_spend"] and (
-             row["roas"] < SETTINGS["breakeven_roas"] or (breakeven_cpa and row["cpa"]>breakeven_cpa*1.1)):
-            reason = ("Below breakeven after test spend — either ROAS under breakeven "
-                      f"or CPA ${row['cpa']:.2f} above allowable. Action: pause or cut and re-enter with re-cut creative/offer.")
-            KILL.append({**row, "reason": reason, "tips": tips})
+        reason = ""
+        if row["spend"] >= SETTINGS["min_scale_spend"] and row["roas"] >= SETTINGS["target_roas"]:
+            reason = "≥ target ROAS and enough spend (verify ≥60% from 7d-click before scaling +20%)."
+            SCALE.append({**row, "reason": reason})
+        elif row["spend"] >= SETTINGS["min_test_spend"] and (row["roas"] < SETTINGS["breakeven_roas"] or row["cpr"]==0 or row["roas"]==0):
+            reason = "Below breakeven or no purchases at test spend."
+            KILL.append({**row, "reason": reason})
         else:
-            reason = ("Not enough evidence yet or between breakeven and target. "
-                      "Action: keep gathering data or iterate a small variant (first 2s, headline, price anchor).")
-            ITERATE.append({**row, "reason": reason, "tips": tips})
+            if row["spend"] < SETTINGS["min_test_spend"]:
+                reason = "Not enough spend (< test threshold)."
+            else:
+                reason = "Between breakeven and target."
+            ITERATE.append({**row, "reason": reason})
 
-    # Risks (account-level)
-    risks = []
-    # High frequency + decaying CTR across account
-    if float(df["freq"].mean(skipna=True) or 0) >= SETTINGS["fatigue_freq"]:
-        risks.append("Rising frequency across account — expect creative fatigue; introduce 1–2 fresh intros this week.")
-    # CPM
-    if "cpm" in df.columns and float(df["cpm"].mean(skipna=True) or 0) > 30:
-        risks.append("Elevated CPMs — broaden audiences or refresh creatives that earn better watch-time to win cheaper delivery.")
-    # Spend concentration
-    spend_share = agg.set_index("name")["spend"].sort_values(ascending=False)
-    if not spend_share.empty and spend_share.iloc[0] > 0.5 * spend_share.sum():
-        risks.append(f"Spend concentration — '{spend_share.index[0]}' holds >50% of spend; diversify with 1–2 near clones.")
-    if not risks:
-        risks.append("No critical risks flagged; stick to rhythm: daily check, 72h rule, small iterative launches.")
+    decisions = {"scale": SCALE, "iterate": ITERATE, "kill": KILL}
 
-    # Playbook
-    playbook = []
-    if diagnosis:
-        dx = diagnosis[0]
-        if "Checkout" in dx:
-            playbook.append({"do":"Checkout trust sprint","impact":"High","effort":"Low",
-                             "steps":["Add card/PayPal/ShopPay badges near button",
-                                      "Inline returns & shipping below CTA",
-                                      "Enable express checkout",
-                                      "Reduce fields and auto-fill where possible"]})
-        elif "ATC→IC" in dx:
-            playbook.append({"do":"Cart → Checkout clarity","impact":"Med","effort":"Low",
-                             "steps":["Surface shipping/fees in cart",
-                                      "Make 'Continue to checkout' the primary action",
-                                      "Remove visual clutter/distractions"]})
-        elif "Click→ATC" in dx:
-            playbook.append({"do":"PDP above-the-fold tighten","impact":"Med","effort":"Med",
-                             "steps":["Rewrite promise to outcome",
-                                      "Add social proof bar (stars + count)",
-                                      "Price anchor with value bullets and micro-urgency"]})
-    for w in SCALE[:2] or rising[:2]:
-        playbook.append({"do":f"Budget +20% on '{w['name']}'","impact":"High","effort":"Low",
-                         "steps":["Verify ≥60% 7-day click",
-                                  "Watch CPR/AOV for 24–48h",
-                                  "If stable, repeat +20% tomorrow"]})
+    return {"summary": summary, "funnel": {"blended": funnel_blended, "diagnosis": diagnosis}, "decisions": decisions}
 
-    return {
-        "summary": summary,
-        "funnel": {"blended": funnel_blended, "diagnosis": diagnosis, "risks": risks},
-        "decisions": {"scale": SCALE, "iterate": ITERATE, "kill": KILL},
-        "rising": rising, "fatigue": fatigue, "playbook": playbook
-    }
-
-# ============================================================
-# Endpoints
-# ============================================================
-
-@app.get("/", response_class=HTMLResponse)
-def index():
-    return INDEX_HTML
-
-@app.post("/ingest_csv")
-def ingest_csv(file: UploadFile = File(...)):
+@app.post("/coach")
+def coach():
     try:
-        raw = _read_csv(file)
-        df = _standardize_columns(raw)
-        MEMORY["df"] = df
-        return {"status": "ok", "rows": len(df), "columns": list(df.columns)}
-    except Exception as e:
-        _set_error(e)
-        return JSONResponse(status_code=500, content={"detail":"Server failed to ingest CSV. Hit /debug/last_error for details."})
+        global LAST_DF
+        analysis = _analyze(LAST_DF if LAST_DF is not None else pd.DataFrame())
+        # Build UI payload
+        rows_for_cards = analysis["decisions"]["iterate"] + analysis["decisions"]["scale"] + analysis["decisions"]["kill"]
+        cards = [_ad_card(r) for r in rows_for_cards]
+        cards.sort(key=lambda c: c["score"], reverse=True)
 
-@app.post("/ingest_csv_debug")
-def ingest_csv_debug(file: UploadFile = File(...)):
-    try:
-        raw = _read_csv(file)
-        sample = raw.head(5).fillna("").astype(str).to_dict(orient="records")
-        dtypes = {c:str(t) for c,t in raw.dtypes.to_dict().items()}
-        return {"columns": list(raw.columns), "dtypes": dtypes, "sample": sample}
-    except Exception as e:
-        _set_error(e)
-        return JSONResponse(status_code=500, content={"detail":"Could not parse CSV. See /debug/last_error."})
-
-@app.get("/coach")
-async def coach():
-    try:
-        df = MEMORY["df"]
-        analysis = _analyze(df)
-        # Optional: external snippets for the top leak
-        leak = analysis["funnel"]["diagnosis"][0] if analysis["funnel"]["diagnosis"] else ""
-        snippets = await _serper_snippets(f"ecommerce {leak or 'checkout conversion'} quick wins")
-        cards = []
-        for bucket in ("scale","iterate","kill"):
-            for r in analysis["decisions"][bucket][:8]:
-                cards.append({
-                    "name": r["name"],
-                    "score": round((r["roas"] / max(SETTINGS["target_roas"], 0.01)) + (r["spend"]/100.0), 3),
-                    "spend": r["spend"], "roas": r["roas"], "cpr": r["cpa"] or r["cpr"],
-                    "cvr": r["cvr"], "ctr": r["ctr"], "hook": r["hook"], "hold": r["hold"],
-                    "bucket": bucket, "tips": r.get("tips",[]), "reason": r.get("reason","")
-                })
         ui = {
             "sections": [
-                {"title":"Account Summary","kind":"summary","data": analysis["summary"]},
-                {"title":"Funnel","kind":"funnel","data": analysis["funnel"]},
-                {"title":"Top Candidates","kind":"cards","data": cards[:12]},
-                {"title":"Rising Winners","kind":"list","data":[f"{r['name']} — ROAS {r['roas_now']:.2f} (prev {r['roas_prev']:.2f})" for r in analysis.get("rising",[])]},
-                {"title":"Fatigue Watch","kind":"list","data":[f"{f['name']} — freq {f['freq']}, CTR now {f['ctr_now']:.2%} (prev {f['ctr_prev']:.2%})" for f in analysis.get('fatigue',[])]},
-                {"title":"Decisions","kind":"decisions","data": analysis["decisions"]},
-                {"title":"Playbook (Next Moves)","kind":"playbook","data": analysis.get("playbook",[])},
-                {"title":"External Pointers","kind":"list","data": snippets},
+                {"title": "Account Summary", "kind": "summary", "data": analysis["summary"]},
+                {"title": "Funnel", "kind": "funnel", "data": analysis["funnel"]},
+                {"title": "Top Candidates", "kind": "cards", "data": cards[:8]},
+                {"title": "Decisions", "kind": "decisions", "data": analysis["decisions"]},
+                {"title": "Risks / Diagnosis", "kind": "list", "data": analysis["funnel"]["diagnosis"]},
             ],
             "narrative": _coach_narrative(analysis["summary"], analysis["funnel"], cards[:3]),
         }
-        return ui
-    except Exception as e:
-        _set_error(e)
-        return JSONResponse(status_code=500, content={"detail":"Coach failed. See /debug/last_error."})
 
-# ---------------------------
-# Prompt Lab
-# ---------------------------
-class PromptLabIn(BaseModel):
-    goal: str
-    context: str = ""
+        return {
+            "summary": analysis["summary"],
+            "funnel": analysis["funnel"],
+            "decisions": analysis["decisions"],
+            "ui": ui,
+            "answer": ui["narrative"],
+        }
+    except Exception as e:
+        set_last_error(e)
+        return JSONResponse({"detail": "Coach failed. Hit /debug/last_error for details."}, status_code=500)
 
 @app.post("/prompt_lab")
-def prompt_lab(inp: PromptLabIn):
-    try:
-        # Pick a template based on the goal
-        g = (inp.goal or "").lower()
-        if any(k in g for k in ["vsl","video","script"]):
-            template = "vsl_depth"
-            prompt = (
-                "You are a senior DTC creative strategist.\n"
-                f"Goal: {inp.goal}\n"
-                f"Audience/context: {inp.context}\n\n"
-                "Output a VSL outline with:\n"
-                "1) Hook options (10, ≤8 words each, pattern-break)\n"
-                "2) Problem agitation (3 bullets)\n"
-                "3) Product mechanism explained simply (ATP/mitochondria if applicable)\n"
-                "4) Social proof (3 micro-testimonials)\n"
-                "5) Offer framing (value stack + price anchor)\n"
-                "6) CTA lines (5 variants)\n"
-                "7) Compliance-sounding safety language (e.g., ‘individual results vary’)\n"
-                "Format in clean bullets only."
-            )
-        elif any(k in g for k in ["ugc","hook","ad"]):
-            template = "ugc_hooks"
-            prompt = (
-                "You are a DTC creative strategist.\n"
-                f"Goal: {inp.goal}\n"
-                f"Audience/context: {inp.context}\n\n"
-                "Generate 20 UGC hooks (≤8 words) that stop scroll using pain, curiosity, proof angles.\n"
-                "Return a simple numbered list."
-            )
-        else:
-            template = "structured_brief"
-            prompt = (
-                "You are a performance creative brief generator.\n"
-                f"Goal: {inp.goal}\n"
-                f"Audience/context: {inp.context}\n\n"
-                "Return: key insight, big idea, 3 angles, 3 thumbnails, opening lines, CTA lines, and a 30s script."
-            )
-        return {"goal": inp.goal, "template_used": template, "prompt": prompt}
-    except Exception as e:
-        _set_error(e)
-        return JSONResponse(status_code=500, content={"detail":"Prompt Lab failed. See /debug/last_error."})
-
-# ---------------------------
-# Script Doctor
-# ---------------------------
-class ScriptIn(BaseModel):
-    script: str
-    product: str = ""
-    audience: str = ""
+def prompt_lab(payload: dict):
+    goal = (payload.get("goal") or "").strip()
+    ctx  = (payload.get("context") or "").strip()
+    if not goal:
+        return {"error": "Missing goal"}
+    base = f"""Act as a senior performance creative strategist.
+Goal: {goal}
+Audience/Context: {ctx or 'general DTC'}.
+Constraints: Meta policy-safe, short lines, benefits-first, screen-native.
+Deliverables:
+1) 10 hooks (≤8 words) labeled Pain/Curiosity/Proof/Social.
+2) 3 concept outlines (beats + on-screen text).
+3) 3 CTA lines that reduce friction.
+4) 5 landing-page trust blocks if drop-off is post-click.
+Return in clean markdown sections."""
+    alternates = [
+        "Make a 25s Reels VSL using problem→solution→proof→CTA. Include 3 pattern interrupts.",
+        "Write 5 primary texts (≤125 chars) + 5 headlines (≤40 chars) optimizing for lower CPR.",
+        "Draft a landing page hero (H1, sub, bullets, proof bar, CTA) for colder traffic."
+    ]
+    return {"goal": goal, "context": ctx, "prompt": base, "alternates": alternates}
 
 @app.post("/script_doctor")
-def script_doctor(inp: ScriptIn):
-    try:
-        text = (inp.script or "").strip()
-        segs = []
-        notes = []
+def script_doctor(payload: dict):
+    txt = (payload.get("script") or "").strip()
+    if not txt:
+        return {"error": "Missing script text"}
 
-        # Lightweight segmentation (heuristic)
-        t_low = text.lower()
-        if any(s in t_low for s in ["how", "what", "why", "are you"]):
-            segs.append("Hook")
-        if any(s in t_low for s in ["pain", "struggle", "tired", "problem"]):
-            segs.append("Problem/Agitate")
-        if any(s in t_low for s in ["because", "it's", "it is", "works by", "uses"]):
-            segs.append("Mechanism")
-        if any(s in t_low for s in ["unlike", "instead", "different"]):
-            segs.append("Differentiate")
-        if any(s in t_low for s in ["just wrap", "easy", "simple", "no pain"]):
-            segs.append("Ease-of-use")
-        if any(s in t_low for s in ["testimonial", "reviews", "before", "after", "thousand"]):
-            segs.append("Proof")
-        if any(s in t_low for s in ["now", "today", "limited", "act"]):
-            segs.append("CTA")
+    # Simple heuristics — upgrade later with NLP
+    lower = txt.lower()
+    segments = [
+        {"label":"Hook",    "ok": lower.startswith(("how","why","what","stop","warning","women","men")) or "?" in lower.split("\n",1)[0]},
+        {"label":"Problem", "ok": any(k in lower for k in ["pain","struggle","problem","issue"])},
+        {"label":"Agitate", "ok": any(k in lower for k in ["worse","keeps","tired of","fed up"])},
+        {"label":"Solution","ok": any(k in lower for k in ["it's because","solution","here's how","works"])},
+        {"label":"Proof",   "ok": any(k in lower for k in ["proof","testimonial","before","after","clinically","study"])},
+        {"label":"Offer",   "ok": any(k in lower for k in ["today","save","bundle","guarantee","free"])},
+        {"label":"CTA",     "ok": any(k in lower for k in ["shop now","get started","try it","learn more","see options","order now"])},
+    ]
+    tips = [
+        "Add a crisp 1-line hook in the first 2s with a pattern break.",
+        "Insert quick proof (testimonial, number, before/after) by 8–12s.",
+        "End with a direct CTA + micro-urgency (‘See options’).",
+        "If CPR high but CTR fine, tighten product promise; if CTR low, rewrite first line & visual opener."
+    ]
+    shotlist = [
+        {"t":"0–3s","shot":"Close-up","text":"Pain question","on_screen":"Large subtitle"},
+        {"t":"4–8s","shot":"Waist + product","text":"Reveal solution","on_screen":"Benefit 1"},
+        {"t":"9–15s","shot":"B-roll + overlay","text":"Proof/demo","on_screen":"‘Real users’"},
+        {"t":"16–22s","shot":"Medium","text":"Offer + CTA","on_screen":"Try risk-free"},
+    ]
+    return {"segments": segments, "tips": tips, "shotlist": shotlist}
 
-        # Recommendations inspired by Shaun/Spencer patterns
-        notes.append("Add a crisp 1-line hook with a hard pattern break in the first 2s.")
-        notes.append("Insert quick proof (testimonial/number/before-after) in 8–12s window.")
-        notes.append("Name the mechanism in plain language, then show it (not just tell).")
-        notes.append("Close with a direct CTA + a reason to act now (micro-urgency).")
-        notes.append("If hooks/holds are low in account, try a ‘show the outcome first’ cold open.")
-
-        return {"segments_detected": list(dict.fromkeys(segs)) or ["(Could not confidently segment)"], "notes": notes}
-    except Exception as e:
-        _set_error(e)
-        return JSONResponse(status_code=500, content={"detail":"Script Doctor failed. See /debug/last_error."})
-
-# ---------------------------
-# Debug
-# ---------------------------
-@app.get("/debug/last_error")
-def last_error():
-    return {"last_error": MEMORY["last_error"]}
-
-# ============================================================
-# Minimal Dark UI
-# ============================================================
-
+# --------------------------------------------------------------------------------------
+# Minimal dark UI (Tailwind) — renders Coach cards, Prompt Lab, Script Doctor
+# --------------------------------------------------------------------------------------
 INDEX_HTML = """
 <!doctype html>
-<html>
+<html lang="en">
 <head>
-  <meta charset="utf-8"/>
-  <meta name="viewport" content="width=device-width, initial-scale=1"/>
-  <title>Erto Agent</title>
-  <link href="https://cdn.jsdelivr.net/npm/tailwindcss@2.2.19/dist/tailwind.min.css" rel="stylesheet">
-  <style>
-    body { background: #0b1220; color: #e5e7eb; }
-    .card { background: rgba(17,24,39,0.7); border: 1px solid #1f2937; }
-    .pill { background: rgba(37,99,235,0.2); border: 1px solid rgba(59,130,246,0.4); }
-    .muted { color:#93a3b8; }
-    code { background:#0f172a; padding:2px 6px; border-radius:6px; }
-  </style>
+<meta charset="utf-8"/>
+<meta name="viewport" content="width=device-width,initial-scale=1"/>
+<title>ERTO Agent</title>
+<script src="https://cdn.tailwindcss.com"></script>
 </head>
-<body class="p-6">
-  <div class="max-w-5xl mx-auto space-y-6">
-    <h1 class="text-2xl font-semibold">Erto Agent</h1>
-    <p class="muted">Upload your Meta CSV, then open <code>/docs</code> or call the endpoints below.</p>
+<body class="bg-[#0b1220] text-slate-100">
+<div class="max-w-6xl mx-auto p-4 space-y-6">
+  <header class="flex items-center justify-between">
+    <h1 class="text-2xl font-semibold">ERTO Agent</h1>
+    <nav class="flex gap-2 text-sm">
+      <button data-tab="ingest"  class="tab px-3 py-1 rounded bg-slate-800">Ingest</button>
+      <button data-tab="coach"   class="tab px-3 py-1 rounded bg-slate-700">Coach</button>
+      <button data-tab="prompt"  class="tab px-3 py-1 rounded bg-slate-800">Prompt Lab</button>
+      <button data-tab="script"  class="tab px-3 py-1 rounded bg-slate-800">Script Doctor</button>
+    </nav>
+  </header>
 
-    <div class="grid md:grid-cols-3 gap-4">
-      <div class="card rounded-xl p-4">
-        <div class="font-medium">1) Ingest CSV</div>
-        <div class="muted text-sm mt-1">POST <code>/ingest_csv</code> (multipart file)</div>
-        <div class="mt-2 text-sm">Use Swagger: <a class="text-blue-400 underline" href="/docs">/docs</a></div>
+  <section id="coach" class="hidden space-y-4">
+    <div id="coach-narrative" class="bg-slate-900/60 rounded-xl p-4 text-slate-200"></div>
+    <div id="coach-sections" class="space-y-4"></div>
+  </section>
+
+  <section id="prompt" class="hidden">
+    <form id="prompt-form" class="bg-slate-900/60 rounded-xl p-4 space-y-3">
+      <input name="goal" class="w-full rounded bg-slate-800 p-2" placeholder="Goal (e.g., 25s VSL for RLT belt)"/>
+      <input name="context" class="w-full rounded bg-slate-800 p-2" placeholder="Context (audience, tone, constraints)"/>
+      <button class="rounded bg-indigo-600 hover:bg-indigo-500 px-3 py-2">Generate</button>
+    </form>
+    <div id="prompt-out" class="mt-4 grid gap-4"></div>
+  </section>
+
+  <section id="script" class="hidden">
+    <form id="script-form" class="bg-slate-900/60 rounded-xl p-4 space-y-3">
+      <textarea name="script" rows="6" class="w-full rounded bg-slate-800 p-2" placeholder="Paste script…"></textarea>
+      <button class="rounded bg-emerald-600 hover:bg-emerald-500 px-3 py-2">Analyze</button>
+    </form>
+    <div id="script-out" class="mt-4 grid gap-4"></div>
+  </section>
+
+  <section id="ingest" class="">
+    <div class="rounded-xl bg-slate-900/60 p-4">
+      <div class="text-slate-300">Upload your CSV in <a class="underline" href="/docs" target="_blank">/docs</a> → <b>POST /ingest_csv</b>, then click the button below.</div>
+      <button id="refresh-coach" class="mt-3 rounded bg-indigo-600 px-3 py-2">Refresh Coach</button>
+      <div id="health" class="mt-2 text-slate-400 text-sm"></div>
+    </div>
+  </section>
+</div>
+
+<script>
+const tabs = document.querySelectorAll('.tab');
+tabs.forEach(b => b.onclick = () => {
+  document.querySelectorAll('section').forEach(s => s.classList.add('hidden'));
+  document.querySelectorAll('.tab').forEach(t => t.classList.replace('bg-slate-700','bg-slate-800'));
+  document.getElementById(b.dataset.tab).classList.remove('hidden');
+  b.classList.replace('bg-slate-800','bg-slate-700');
+});
+
+async function fetchCoach(){
+  const res = await fetch('/coach', {method:'POST', headers:{'Content-Type':'application/json'}, body: JSON.stringify({})});
+  const data = await res.json();
+  if(data.ui){ renderCoach(data.ui); }
+  else { document.getElementById('coach-narrative').innerText = 'No data yet. Ingest a CSV first.'; }
+}
+function chip(k,v){ return `<div class="px-2 py-1 rounded bg-slate-800 text-sm"><span class="text-slate-400">${k}</span> <span class="ml-1 font-medium">${v}</span></div>`;}
+function card(c){
+  const ms = (c.metrics||[]).map(m => chip(m.k, m.v)).join('');
+  const tips = (c.tips||[]).map(t => `<li>${t}</li>`).join('');
+  return `
+  <div class="rounded-2xl bg-slate-900/70 p-4 border border-slate-800">
+    <div class="flex items-center justify-between">
+      <div class="text-lg font-semibold">${c.title}</div>
+      <div class="text-sm px-2 py-1 rounded bg-indigo-600/20 border border-indigo-600/30">Score ${c.score}</div>
+    </div>
+    <div class="mt-3 flex flex-wrap gap-2">${ms}</div>
+    <div class="mt-3 text-slate-300">
+      <div class="text-slate-400 text-sm mb-1">Tips</div>
+      <ul class="list-disc ml-5">${tips}</ul>
+    </div>
+  </div>`;
+}
+function sectionBlock(s){
+  if(s.kind === 'summary'){
+    const a = s.data;
+    return `<div class="rounded-xl bg-slate-900/60 p-4 grid sm:grid-cols-2 gap-2">
+      ${chip("Spend", `$${(a.spend||0).toFixed(2)}`)}
+      ${chip("Purchases", a.purchases||0)}
+      ${chip("Avg ROAS", (a.avg_roas||0).toFixed(2))}
+      ${chip("Target ROAS", a.settings?.target_roas||'-')}
+    </div>`;
+  }
+  if(s.kind === 'funnel'){
+    const f = s.data.blended || {};
+    return `<div class="rounded-xl bg-slate-900/60 p-4">
+      <div class="text-slate-300 mb-2">Funnel</div>
+      <div class="flex flex-wrap gap-2">
+        ${chip("Click→ATC", ((f.click_to_atc||0)*100).toFixed(1)+"%")}
+        ${chip("ATC→IC", ((f.atc_to_ic||0)*100).toFixed(1)+"%")}
+        ${chip("IC→Purchase", ((f.ic_to_purchase||0)*100).toFixed(1)+"%")}
       </div>
-      <div class="card rounded-xl p-4">
-        <div class="font-medium">2) Coach</div>
-        <div class="muted text-sm mt-1">GET <code>/coach</code> → analysis, decisions, playbook</div>
-      </div>
-      <div class="card rounded-xl p-4">
-        <div class="font-medium">3) Prompt Lab</div>
-        <div class="muted text-sm mt-1">POST <code>/prompt_lab</code> (goal, context)</div>
-      </div>
-      <div class="card rounded-xl p-4">
-        <div class="font-medium">4) Script Doctor</div>
-        <div class="muted text-sm mt-1">POST <code>/script_doctor</code> (script)</div>
-      </div>
-      <div class="card rounded-xl p-4">
-        <div class="font-medium">Debug</div>
-        <div class="muted text-sm mt-1">GET <code>/debug/last_error</code></div>
+    </div>`;
+  }
+  if(s.kind === 'cards'){
+    return `<div class="grid md:grid-cols-2 gap-3">${(s.data||[]).map(card).join('')}</div>`;
+  }
+  if(s.kind === 'decisions'){
+    const d = s.data||{};
+    function list(name, arr){
+      return `<div class="rounded-xl bg-slate-900/60 p-4">
+        <div class="font-medium mb-2">${name}</div>
+        <ul class="list-disc ml-5 text-slate-300">${(arr||[]).slice(0,8).map(x=>`<li>${x.name||x.ad_id} — ${x.reason||''}</li>`).join('')}</ul>
+      </div>`;
+    }
+    return `<div class="grid md:grid-cols-3 gap-3">
+      ${list("Scale", d.scale)}
+      ${list("Iterate", d.iterate)}
+      ${list("Kill", d.kill)}
+    </div>`;
+  }
+  if(s.kind === 'list'){
+    return `<div class="rounded-xl bg-amber-900/20 border border-amber-700/30 p-4">
+      <div class="font-medium mb-2">Risks / Diagnosis</div>
+      <ul class="list-disc ml-5">${(s.data||[]).map(x=>`<li>${x}</li>`).join('')}</ul>
+    </div>`;
+  }
+  return "";
+}
+function renderCoach(ui){
+  document.getElementById('coach').classList.remove('hidden');
+  document.querySelector('[data-tab="coach"]').classList.replace('bg-slate-800','bg-slate-700');
+  document.getElementById('coach-narrative').innerHTML = `<div class="prose prose-invert">${(ui.narrative||'').replace(/\\n/g,'<br/>')}</div>`;
+  document.getElementById('coach-sections').innerHTML = (ui.sections||[]).map(sectionBlock).join('');
+}
+document.getElementById('refresh-coach').onclick = async ()=>{
+  const h = await fetch('/healthz').then(r=>r.json());
+  document.getElementById('health').innerText = h.has_data ? 'Data loaded — open Coach.' : 'No data yet.';
+  fetchCoach();
+};
+
+// Prompt Lab
+document.getElementById('prompt-form').onsubmit = async (e)=>{
+  e.preventDefault();
+  const fd = new FormData(e.target);
+  const payload = Object.fromEntries(fd.entries());
+  const res = await fetch('/prompt_lab',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify(payload)});
+  const data = await res.json();
+  const out = document.getElementById('prompt-out');
+  out.innerHTML = `
+    <div class="rounded-xl bg-slate-900/60 p-4">
+      <div class="text-slate-400 text-sm mb-2">Goal</div>
+      <div>${data.goal||''}</div>
+    </div>
+    <div class="rounded-xl bg-slate-900/60 p-4">
+      <div class="text-slate-400 text-sm mb-2">Main Prompt</div>
+      <pre class="whitespace-pre-wrap text-slate-200">${data.prompt||''}</pre>
+    </div>
+    <div class="rounded-xl bg-slate-900/60 p-4">
+      <div class="text-slate-400 text-sm mb-2">Alternates</div>
+      <ul class="list-disc ml-5">${(data.alternates||[]).map(x=>`<li>${x}</li>`).join('')}</ul>
+    </div>`;
+};
+
+// Script Doctor
+document.getElementById('script-form').onsubmit = async (e)=>{
+  e.preventDefault();
+  const fd = new FormData(e.target);
+  const payload = Object.fromEntries(fd.entries());
+  const res = await fetch('/script_doctor',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify(payload)});
+  const d = await res.json();
+  const out = document.getElementById('script-out');
+  out.innerHTML = `
+    <div class="rounded-xl bg-slate-900/60 p-4">
+      <div class="font-medium mb-2">Structure</div>
+      <div class="flex flex-wrap gap-2">
+        ${(d.segments||[]).map(s=>`<div class="px-2 py-1 rounded ${s.ok?'bg-emerald-900/30 border-emerald-700/30':'bg-slate-800 border-slate-700'} border">${s.label}</div>`).join('')}
       </div>
     </div>
-
-    <div class="card rounded-xl p-4">
-      <div class="font-medium">Optional: External Suggestions</div>
-      <div class="muted text-sm mt-1">Set <code>SERPER_API_KEY</code> env and flip <code>SETTINGS["external_data"]=True</code> in the code to show quick outside ideas aligned to your biggest funnel leak.</div>
+    <div class="rounded-xl bg-slate-900/60 p-4">
+      <div class="font-medium mb-2">Tips</div>
+      <ul class="list-disc ml-5">${(d.tips||[]).map(x=>`<li>${x}</li>`).join('')}</ul>
     </div>
-  </div>
+    <div class="rounded-xl bg-slate-900/60 p-4">
+      <div class="font-medium mb-2">Shot-List</div>
+      <div class="grid md:grid-cols-2 gap-3">
+        ${(d.shotlist||[]).map(s=>`<div class="rounded bg-slate-800 p-3">
+            <div class="text-slate-400 text-sm">${s.t}</div>
+            <div class="font-medium">${s.shot}</div>
+            <div class="text-slate-300">${s.text}</div>
+            <div class="text-slate-400 text-sm">On-screen: ${s.on_screen}</div>
+        </div>`).join('')}
+      </div>
+    </div>`;
+};
+
+// auto-load health & coach on first view
+fetch('/healthz').then(r=>r.json()).then(h=>{
+  document.getElementById('health').innerText = h.has_data ? 'Data loaded — open Coach.' : 'No data yet.';
+});
+fetchCoach();
+</script>
 </body>
 </html>
 """
 
-# ============================================================
-# Done.
-# ============================================================
+@app.get("/", response_class=HTMLResponse)
+def index():
+    return HTMLResponse(INDEX_HTML)
+
