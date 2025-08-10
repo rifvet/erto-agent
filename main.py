@@ -121,18 +121,87 @@ df["ad_name"] = df.get("ad_name", df["ad_id"]).fillna("NA").astype(str)
 async def analyze(req: AnalyzeRequest):
     today = str(date.today())
     with engine.begin() as conn:
-        rows = conn.execute(text("SELECT * FROM ad_metrics WHERE dte=:d"), {"d":today}).mappings().all()
+        df = pd.read_sql(text("SELECT * FROM ad_metrics WHERE dte=:d"), conn, params={"d": today})
+
+    if df.empty:
+        return {
+            "scale": [],
+            "kill": [],
+            "iterate": [],
+            "creative_gaps": {
+                "needed_new_creatives": req.testing_capacity,
+                "angle_mix": req.angle_mix,
+                "bans": req.bans,
+            },
+        }
+
+    # Ensure both identifiers are present
+    if "ad_id" not in df.columns:
+        df["ad_id"] = "NA"
+    if "ad_name" not in df.columns:
+        df["ad_name"] = df["ad_id"]
+
+    # Aggregate per ad
+    agg = (
+        df.groupby("ad_id", as_index=False)
+          .agg(
+              ad_name=("ad_name", "first"),
+              spend=("spend", "sum"),
+              impressions=("impressions", "sum"),
+              ctr=("ctr", "mean"),
+              cpc=("cpc", "mean"),
+              hook_rate=("hook_rate", "mean"),
+              hold_rate=("hold_rate", "mean"),
+              cvr=("cvr", "mean"),
+              roas=("roas", "mean"),
+              cpa=("cpa", "mean"),
+          )
+    )
+
     scale, kill, iterate = [], [], []
-    for r in rows:
-        if r["roas"] >= TARGET_ROAS and r["cpa"] <= TARGET_CPA and r["cvr"] >= TARGET_CVR and r["spend"] >= 50:
-            scale.append({"ad_id": r["ad_id"], "reason": "Hit target ROAS/CPA/CVR"})
-        elif (r["roas"] < BREAKEVEN_ROAS and r["spend"] >= 50) or (r["cpa"] > BREAKEVEN_CPA_TRUE_AOV and r["spend"] >= 50):
-            kill.append({"ad_id": r["ad_id"], "reason": "Below breakeven or CPA too high"})
+
+    for _, row in agg.iterrows():
+        r = row.to_dict()
+        label = r.get("ad_name") or r.get("ad_id") or "NA"
+        spend = float(r.get("spend", 0) or 0)
+        roas  = float(r.get("roas", 0) or 0)
+        cpa   = float(r.get("cpa", 0) or 0)
+        cvr   = float(r.get("cvr", 0) or 0)
+
+        item = {
+            "ad_id": r.get("ad_id", "NA"),
+            "name": label,
+            "spend": round(spend, 2),
+            "roas": round(roas, 2),
+            "cpa": round(cpa, 2),
+            "cvr": round(cvr, 2),
+        }
+
+        if spend >= MIN_SPEND_TO_DECIDE:
+            if roas >= TARGET_ROAS and cpa <= TARGET_CPA and cvr >= TARGET_CVR:
+                item["reason"] = "Hit target ROAS/CPA/CVR"
+                scale.append(item)
+            elif roas < BREAKEVEN_ROAS or cpa > BREAKEVEN_CPA_TRUE_AOV:
+                item["reason"] = "Below breakeven or CPA too high"
+                kill.append(item)
+            else:
+                item["reason"] = "Between breakeven and target"
+                iterate.append(item)
         else:
-            iterate.append({"ad_id": r["ad_id"], "reason": "Between breakeven and target"})
+            item["reason"] = f"Not enough spend (<{MIN_SPEND_TO_DECIDE})"
+            iterate.append(item)
+
     needed = max(len(kill), req.testing_capacity)
-    return {"scale":scale,"kill":kill,"iterate":iterate,
-            "creative_gaps":{"needed_new_creatives":needed,"angle_mix":req.angle_mix,"bans":req.bans}}
+    return {
+        "scale": scale,
+        "kill": kill,
+        "iterate": iterate,
+        "creative_gaps": {
+            "needed_new_creatives": needed,
+            "angle_mix": req.angle_mix,
+            "bans": req.bans,
+        },
+    }
 
 @app.post("/diagnose")
 async def diagnose(_: DiagnoseRequest):
