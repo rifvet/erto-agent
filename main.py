@@ -1,121 +1,184 @@
-from fastapi import FastAPI, UploadFile, File, Body
-from pydantic import BaseModel
-from typing import Dict, List, Optional, Any
-import pandas as pd
-import sqlalchemy as sa
-from sqlalchemy import text
+from fastapi import FastAPI, UploadFile, File, HTTPException
+from pydantic import BaseModel, Field
+from sqlalchemy import create_engine, text
 from datetime import date
-import json, os
+import pandas as pd
+import json
+import os
+import io
 
-from settings import (
-    DATABASE_URL,
-    TARGET_ROAS, BREAKEVEN_ROAS, TARGET_CPA,
-    BREAKEVEN_CPA_TRUE_AOV, TARGET_CVR, EXPERT_MODE
-)
-from prompts import make_claude_prompt
+# --- Settings & KPIs ---
+try:
+    import settings as cfg  # your settings.py
+except Exception:
+    cfg = object()
 
-app = FastAPI(title="ERTO Ad Strategist Agent")
-engine = sa.create_engine(DATABASE_URL, future=True)
+def _get(name: str, default: str):
+    return getattr(cfg, name, os.getenv(name, default))
 
-BRAND_PATH = "brand_knowledge.json"
+DATABASE_URL = _get("DATABASE_URL", "sqlite:///erto_agent.db")
+TARGET_ROAS = float(_get("TARGET_ROAS", "2.54"))
+BREAKEVEN_ROAS = float(_get("BREAKEVEN_ROAS", "1.54"))
+TARGET_CPA = float(_get("TARGET_CPA", "39.30"))
+BREAKEVEN_CPA_TRUE_AOV = float(_get("BREAKEVEN_CPA_TRUE_AOV", "81.56"))
+BREAKEVEN_CPA_BUY1 = float(_get("BREAKEVEN_CPA_BUY1", "65.50"))
+TARGET_CVR = float(_get("TARGET_CVR", "4.2"))
+MIN_SPEND_TO_DECIDE = float(_get("MIN_SPEND_TO_DECIDE", "50"))
 
-# Bootstrap tables
+# --- App & DB ---
+app = FastAPI(title="Erto Ad Strategist Agent", version="1.0.0")
+engine = create_engine(DATABASE_URL, future=True)
+
+# Create table if it doesn’t exist
 with engine.begin() as conn:
-    conn.exec_driver_sql("""
-    CREATE TABLE IF NOT EXISTS ad_metrics (
-      id INTEGER PRIMARY KEY AUTOINCREMENT,
-      dte TEXT NOT NULL,
-      ad_id TEXT NOT NULL,
-      spend REAL NOT NULL,
-      impressions INTEGER,
-      ctr REAL,
-      cpc REAL,
-      hook_rate REAL,
-      hold_rate REAL,
-      cvr REAL,
-      roas REAL,
-      cpa REAL,
-      audience TEXT,
-      placement TEXT,
-      device TEXT
-    );
-    """)
+    conn.execute(text(
+        """
+        CREATE TABLE IF NOT EXISTS ad_metrics (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            dte TEXT,
+            ad_id TEXT,
+            ad_name TEXT,
+            campaign_name TEXT,
+            adset_name TEXT,
+            spend REAL,
+            impressions INTEGER,
+            ctr REAL,
+            cpc REAL,
+            hook_rate REAL,
+            hold_rate REAL,
+            cvr REAL,
+            roas REAL,
+            cpa REAL
+        );
+        """
+    ))
 
+# --- Models ---
 class AnalyzeRequest(BaseModel):
     testing_capacity: int = 6
-    angle_mix: Dict[str,int] = {"pain":40, "curiosity":30, "proof":20, "social":10}
-    bans: List[str] = []
+    angle_mix: dict = Field(default_factory=lambda: {"pain": 40, "curiosity": 30, "proof": 20, "social": 10})
+    bans: list[str] = Field(default_factory=list)
 
 class DiagnoseRequest(BaseModel):
-    segments: Optional[List[str]] = ["device","placement"]
+    site_speed_sec: float | None = None
 
-class BrandUpdate(BaseModel):
-    data: Dict[str, Any]
+# --- Helpers ---
+NUMERIC_COLS = [
+    "spend", "impressions", "ctr", "cpc", "hook_rate", "hold_rate", "cvr", "roas", "cpa",
+]
 
-def load_brand():
-    if not os.path.exists(BRAND_PATH):
-        return {"brand_voice":"", "usps":[], "winning_angles":[], "avatars":[], "positioning":""}
-    with open(BRAND_PATH,"r") as f:
-        return json.load(f)
+META_RENAME = {
+    # Common Meta export headers → internal
+    "Ad ID": "ad_id",
+    "Ad Name": "ad_name",
+    "Campaign Name": "campaign_name",
+    "Ad Set Name": "adset_name",
+    "Amount Spent (USD)": "spend",
+    "Impressions": "impressions",
+    "CTR (All)": "ctr",
+    "CPC (Cost per link click)": "cpc",
+    "Adds to Cart": "add_to_cart",
+    "Initiate Checkout": "initiate_checkout",
+    "Purchases": "purchases",
+    # Sometimes exports already come simplified; mapping won’t hurt
+    "spend": "spend",
+    "impressions": "impressions",
+    "ctr": "ctr",
+    "cpc": "cpc",
+    "cvr": "cvr",
+    "roas": "roas",
+    "cpa": "cpa",
+}
 
+BRAND_FILE = "brand_knowledge.json"
+
+
+def load_brand() -> dict:
+    try:
+        with open(BRAND_FILE, "r", encoding="utf-8") as f:
+            return json.load(f)
+    except Exception:
+        return {
+            "brand_voice": "Direct, high-signal, no fluff.",
+            "positioning": "Quality product with standout durability and comfort.",
+            "avatars": [
+                {"name": "Main Buyer", "pains": ["overpriced", "low trust"], "motives": ["value", "quality"]}
+            ],
+            "competitors": ["Generic Brand A", "Brand B"],
+            "usps": ["Real materials", "Faster shipping", "Support that cares"],
+        }
+
+
+def to_float(val):
+    try:
+        if val is None or val == "":
+            return 0.0
+        if isinstance(val, str) and val.endswith("%"):
+            return float(val.replace("%", ""))
+        return float(val)
+    except Exception:
+        return 0.0
+
+# --- Routes ---
 @app.get("/health")
-def health():
-    return {"ok": True}
+async def health():
+    return {"status": "ok"}
 
-@app.get("/brand")
-def get_brand():
-    return load_brand()
-
-@app.post("/update_brand_knowledge")
-def update_brand(b: BrandUpdate):
-    with open(BRAND_PATH, "w") as f:
-        json.dump(b.data, f, indent=2)
-    return {"status":"updated"}
 
 @app.post("/ingest_csv")
 async def ingest_csv(file: UploadFile = File(...)):
-    df = pd.read_csv(file.file).fillna(0) 
-    # Normalize common Meta headers → internal names we use everywhere
-# Supports both Ad ID and Ad Name. Falls back cleanly if one is missing.
-df.rename(columns={
-    "Ad ID": "ad_id",
-    "Ad Name": "ad_name",
-}, inplace=True)
+    """Upload a Meta CSV for *today*. Rows append into ad_metrics."""
+    if not file.filename.lower().endswith((".csv")):
+        raise HTTPException(status_code=400, detail="Please upload a .csv file")
 
-if "ad_id" not in df.columns and "ad_name" in df.columns:
-    df["ad_id"] = df["ad_name"].astype(str)
-if "ad_name" not in df.columns and "ad_id" in df.columns:
-    df["ad_name"] = df["ad_id"].astype(str)
+    raw = await file.read()
+    try:
+        df = pd.read_csv(io.BytesIO(raw))
+    except Exception as e:
+        raise HTTPException(status_code=400, detail=f"CSV parse error: {e}")
 
-# Make sure both exist (even if CSV lacked both columns)
-df["ad_id"] = df.get("ad_id", "NA").fillna("NA").astype(str)
-df["ad_name"] = df.get("ad_name", df["ad_id"]).fillna("NA").astype(str)
+    # Normalize headers
+    df.rename(columns=META_RENAME, inplace=True)
+
+    # Ensure identifiers
+    if "ad_id" not in df.columns and "ad_name" in df.columns:
+        df["ad_id"] = df["ad_name"].astype(str)
+    if "ad_name" not in df.columns and "ad_id" in df.columns:
+        df["ad_name"] = df["ad_id"].astype(str)
+    df["ad_id"] = df.get("ad_id", "NA").fillna("NA").astype(str)
+    df["ad_name"] = df.get("ad_name", df["ad_id"]).fillna("NA").astype(str)
+
+    # Optional common fields
+    for col in ["campaign_name", "adset_name"]:
+        if col not in df.columns:
+            df[col] = ""
+
+    # Create missing metric columns as 0
+    for col in NUMERIC_COLS:
+        if col not in df.columns:
+            df[col] = 0
+
+    # Coerce numerics
+    for col in NUMERIC_COLS:
+        df[col] = pd.to_numeric(df[col], errors="coerce").fillna(0)
+
+    # Add date column
     if "dte" not in df.columns:
         df["dte"] = str(date.today())
+
+    # Keep only known columns when writing
+    keep_cols = [
+        "dte", "ad_id", "ad_name", "campaign_name", "adset_name",
+        "spend", "impressions", "ctr", "cpc", "hook_rate", "hold_rate",
+        "cvr", "roas", "cpa",
+    ]
+    df = df[[c for c in keep_cols if c in df.columns]]
+
     with engine.begin() as conn:
-        for _, r in df.iterrows():
-            conn.execute(text("""
-                INSERT INTO ad_metrics (dte, ad_id, spend, impressions, ctr, cpc,
-                  hook_rate, hold_rate, cvr, roas, cpa, audience, placement, device)
-                VALUES (:dte, :ad_id, :spend, :impressions, :ctr, :cpc, :hook_rate,
-                  :hold_rate, :cvr, :roas, :cpa, :audience, :placement, :device)
-            """), {
-                "dte": str(r["dte"]),
-                "ad_id": str(r.get("ad_id","NA")),
-                "spend": float(r.get("spend",0)),
-                "impressions": int(r.get("impressions",0)),
-                "ctr": float(r.get("ctr",0)),
-                "cpc": float(r.get("cpc",0)),
-                "hook_rate": float(r.get("hook_rate",0)),
-                "hold_rate": float(r.get("hold_rate",0)),
-                "cvr": float(r.get("cvr",0)),
-                "roas": float(r.get("roas",0)),
-                "cpa": float(r.get("cpa",0)),
-                "audience": str(r.get("audience","")),
-                "placement": str(r.get("placement","")),
-                "device": str(r.get("device","")),
-            })
-    return {"status":"ok","rows":len(df)}
+        df.to_sql("ad_metrics", conn, if_exists="append", index=False)
+
+    return {"status": "ok", "rows": int(len(df))}
+
 
 @app.post("/analyze")
 async def analyze(req: AnalyzeRequest):
@@ -135,7 +198,7 @@ async def analyze(req: AnalyzeRequest):
             },
         }
 
-    # Ensure both identifiers are present
+    # Ensure identifiers
     if "ad_id" not in df.columns:
         df["ad_id"] = "NA"
     if "ad_name" not in df.columns:
@@ -163,10 +226,10 @@ async def analyze(req: AnalyzeRequest):
     for _, row in agg.iterrows():
         r = row.to_dict()
         label = r.get("ad_name") or r.get("ad_id") or "NA"
-        spend = float(r.get("spend", 0) or 0)
-        roas  = float(r.get("roas", 0) or 0)
-        cpa   = float(r.get("cpa", 0) or 0)
-        cvr   = float(r.get("cvr", 0) or 0)
+        spend = to_float(r.get("spend", 0))
+        roas  = to_float(r.get("roas", 0))
+        cpa   = to_float(r.get("cpa", 0))
+        cvr   = to_float(r.get("cvr", 0))
 
         item = {
             "ad_id": r.get("ad_id", "NA"),
@@ -203,73 +266,74 @@ async def analyze(req: AnalyzeRequest):
         },
     }
 
+
 @app.post("/diagnose")
-async def diagnose(_: DiagnoseRequest):
+async def diagnose(req: DiagnoseRequest):
     today = str(date.today())
     with engine.begin() as conn:
-        df = pd.read_sql(text("SELECT * FROM ad_metrics WHERE dte=:d"), conn, params={"d":today})
+        df = pd.read_sql(text("SELECT * FROM ad_metrics WHERE dte=:d"), conn, params={"d": today})
+
     if df.empty:
-        return {"error":"No data for today"}
+        return {"message": "No data ingested today. Upload a CSV via /ingest_csv first."}
 
-    # Derived metrics (simple; replace with real ATC/Checkout columns if present)
-    clicks = (df["impressions"]*df["ctr"]/100.0).sum()
-    atcs   = (df["impressions"]*df["ctr"]/100.0*df["cvr"]/100.0).sum()
-    click_to_atc = (atcs/clicks*100) if clicks>0 else 0
-
-    findings = []
-    brand = load_brand()
-    if click_to_atc < 4:
-        findings.append({
-          "diagnosis":"High Clicks, Low ATC",
-          "evidence":{"Click→ATC%":round(click_to_atc,2)},
-          "interpretation":"Promise–page mismatch and/or trust deficit.",
-          "primary_causes_ranked":[
-            "Trust layer missing above CTA",
-            "Price/returns opacity",
-            "Slow LCP or visual clutter"
-          ],
-          "actions_ordered":[
-            "Add trust pack above CTA (stars, 2 micro-reviews, 30-day line, payments/lock)",
-            "Show shipping/returns teaser by price; add delivery ETA",
-            "Compress hero to ≤200KB WebP; defer non-critical JS; target LCP ≤2.3s"
-          ],
-          "expected_impact":"+3–5pp Click→ATC within 7 days",
-          "verification_plan":"A/B hero+trust vs control; pass if Click→ATC ≥6% and ROAS stable",
-          "brand_context":{"voice": brand.get("brand_voice",""), "usps": brand.get("usps",[])}
-        })
-
-    # Build Claude prompts from findings + brand knowledge
-    prompts = []
-    for f in findings:
-        if "High Clicks, Low ATC" in f["diagnosis"]:
-            prompts.append({
-                "angle":"Comfort & Control",
-                "audience":"Women 55+ who clicked but didn’t add to cart",
-                "prompt": make_claude_prompt(
-                    "Comfort & Control",
-                    "Women 55+ who clicked but didn’t add to cart",
-                    "Trust deficit post-click; reinforce proof and routine-ease",
-                    brand.get("brand_voice",""),
-                    brand.get("usps",[])
-                )
-            })
-
-    roas = float(df["roas"].mean())
-    cvr  = float(df["cvr"].mean())
-    return {"summary":{"clicks":int(clicks),"roas":round(roas,2),"cvr":round(cvr,2),"click_to_atc_pct":round(click_to_atc,2)},
-            "findings":findings,"claude_prompts":prompts}
-
-@app.post("/generate_creatives")
-def generate_creatives(payload: dict = Body(...)):
-    """Given an angle & audience, return a brand-infused Claude prompt."""
-    angle = payload.get("angle","Comfort & Control")
-    audience = payload.get("audience","Women 45+")
-    reason = payload.get("reason","Weekly refresh")
-    brand = load_brand()
-    return {
-        "angle": angle,
-        "audience": audience,
-        "prompt": make_claude_prompt(
-            angle, audience, reason, brand.get("brand_voice",""), brand.get("usps",[])
-        )
+    # Totals (use available columns)
+    totals = {
+        "spend": float(df.get("spend", pd.Series([0])).sum()),
+        "impressions": int(df.get("impressions", pd.Series([0])).sum()),
+        "avg_ctr": float(df.get("ctr", pd.Series([0])).mean()),
+        "avg_cvr": float(df.get("cvr", pd.Series([0])).mean()),
+        "avg_roas": float(df.get("roas", pd.Series([0])).mean()),
+        "avg_cpa": float(df.get("cpa", pd.Series([0])).mean()),
     }
+
+    # Simple weak-point logic
+    issues = []
+    if totals["avg_ctr"] < 1.0:
+        issues.append("Low CTR (<1%): hooks/thumbnails not stopping scroll")
+    if totals["avg_cvr"] < TARGET_CVR:
+        issues.append(f"Low CVR (<{TARGET_CVR}%): offer/landing trust or page flow")
+    if totals["avg_roas"] < BREAKEVEN_ROAS:
+        issues.append(f"ROAS below breakeven (<{BREAKEVEN_ROAS})")
+    if totals["avg_cpa"] > BREAKEVEN_CPA_TRUE_AOV:
+        issues.append(f"CPA above breakeven (>{BREAKEVEN_CPA_TRUE_AOV})")
+
+    brand = load_brand()
+
+    # Claude-ready prompts (you paste into Claude)
+    prompts = {
+        "hooks": f"Write 10 scroll-stopping hooks (max 7 words) in the brand voice: {brand.get('brand_voice','')}. Target pains: {brand.get('avatars',[{}])[0].get('pains', [])}.",
+        "scripts": f"Draft 3x 30s UGC scripts using {brand.get('usps', [])} with curiosity opener → proof → CTA. Include at least one objection-handle.",
+        "lp": "Suggest 5 trust-builders for the product page (microcopy, social proof, risk reversal, badges, reviews block).",
+    }
+
+    return {
+        "totals": totals,
+        "weak_points": issues or ["No glaring issues vs targets; keep scaling tests running."],
+        "recommendations": [
+            "Launch 2 new creatives/day: hook-first tests across pain/curiosity/proof/social angles.",
+            "If CTR <1%, rework intros & thumbnails. If CVR < target, address risk/reviews/clarity above the fold.",
+            "Tighten targeting & bids only after creatives stabilize; avoid early optimization whiplash.",
+        ],
+        "claude_prompts": prompts,
+    }
+
+
+@app.get("/brand")
+async def get_brand():
+    return load_brand()
+
+
+class UpdateBrandRequest(BaseModel):
+    brand: dict
+
+
+@app.post("/update_brand_knowledge")
+async def update_brand_knowledge(req: UpdateBrandRequest):
+    try:
+        with open(BRAND_FILE, "w", encoding="utf-8") as f:
+            json.dump(req.brand, f, indent=2, ensure_ascii=False)
+        return {"status": "ok"}
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=str(e))
+
+# (No need for if __name__ == "__main__": as Render runs uvicorn directly)
